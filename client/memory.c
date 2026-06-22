@@ -4,8 +4,15 @@
 #include <linux/fcntl.h>
 #include <linux/fs.h>
 #include <linux/mman.h>
+#include <linux/unistd.h>
 
 #include <memory.h>
+
+#ifdef __riscv
+#ifndef __NR_riscv_flush_icache
+#define __NR_riscv_flush_icache 259
+#endif
+#endif
 
 
 #define MEM_BASE ((void*) 0x0000400000000000ull)
@@ -112,6 +119,22 @@ mem_write_code(void* dst, const void* src, size_t size) {
         __asm__ volatile("dsb ish");
     }
     __asm__ volatile("isb");
+#elif defined(__riscv)
+    // RISC-V requires icache flush via syscall on Linux.
+    // Use SYS_riscv_flush_icache (syscall __NR_riscv_flush_icache).
+    // Do not use fence.i directly - it is insufficient for user-space on Linux.
+    // SYS_riscv_flush_icache is available since Linux 4.15.
+    // syscall(int nr, uintptr_t start, uintptr_t end, uintptr_t flags)
+    // start and end are pointers, flags should be 0 (FLUSH_ICACHE_LOCAL).
+    {
+        uintptr_t start = (uintptr_t) dst;
+        uintptr_t end = start + size;
+        register uintptr_t a0 __asm__("a0") = start;
+        register uintptr_t a1 __asm__("a1") = end;
+        register uintptr_t a2 __asm__("a2") = 0;
+        register long a7 __asm__("a7") = __NR_riscv_flush_icache;
+        __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    }
 #else
 #error "Implement ICache flush for unknown target"
 #endif

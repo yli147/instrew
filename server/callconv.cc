@@ -38,6 +38,12 @@ CallConv GetFastCC(int host_arch, int guest_arch) {
         return CallConv::X86_AARCH64_X;
     if (host_arch == EM_AARCH64 && guest_arch == EM_AARCH64)
         return CallConv::AARCH64_AARCH64_X;
+    if (host_arch == EM_RISCV && guest_arch == EM_X86_64)
+        return CallConv::X86_RV64_LP64;
+    if (host_arch == EM_RISCV && guest_arch == EM_RISCV)
+        return CallConv::RV64_RV64_LP64;
+    if (host_arch == EM_RISCV && guest_arch == EM_AARCH64)
+        return CallConv::AARCH64_RV64_LP64;
     return CallConv::CDECL;
 }
 
@@ -54,6 +60,9 @@ int GetCallConvClientNumber(CallConv cc) {
     case CallConv::AARCH64_X86_REGCALL: return 2;
     case CallConv::X86_AARCH64_X: return 3;
     case CallConv::AARCH64_AARCH64_X: return 3;
+    case CallConv::X86_RV64_LP64: return 4;
+    case CallConv::RV64_RV64_LP64: return 4;
+    case CallConv::AARCH64_RV64_LP64: return 4;
     default: return 0;
     }
 }
@@ -647,6 +656,83 @@ llvm::Function* ChangeCallConv(llvm::Function* fn, CallConv cc) {
         goto callconv_hhvm_common;
     }
 #endif
+    // RISC-V LP64 calling convention (A1' design).
+    //
+    // LLVM 17's RISC-V backend hard-caps return-value lowering at 2
+    // registers (a0/a1). A wider ret struct is demoted to sret with a
+    // hidden a0 pointer that shifts all physical arg registers by one.
+    // Fastcc doesn't help — the 2-reg cap in CC_RISCV::CanLowerReturn is
+    // unconditional. We work with this: 6 IR args (sptr + PC + 5 GPR)
+    // become physical [a0=sret_ptr, a1=sptr, a2=PC, a3-a7=packed]. 5 in-
+    // reg guest regs (down from AArch64/x86 host's 8) but no SwiftSelf.
+    case CallConv::X86_RV64_LP64: {
+        static constexpr SptrField lp64_fields[] = {
+            { SptrFields::x86_64::RIP,  1,  1  },
+            { SptrFields::x86_64::RAX,  2,  2  },
+            { SptrFields::x86_64::RCX,  3,  3  },
+            { SptrFields::x86_64::RDX,  4,  4  },
+            { SptrFields::x86_64::RBX,  5,  5  },
+            { SptrFields::x86_64::RSP,  6,  6  },
+        };
+        static const constexpr SptrFieldMap lp64_fieldmap = CreateSptrMap(lp64_fields);
+        fields = lp64_fields;
+        fieldmap = &lp64_fieldmap;
+    callconv_lp64_common:
+        // 7-element ret struct (sptr + 6 i64s) is lowered by LLVM 17
+        // RISC-V as sret: hidden ptr in a0, remaining args shift up.
+        ret_ty = llvm::StructType::get(sptr_ty, i64, i64, i64, i64, i64, i64);
+        fn_ty = llvm::FunctionType::get(ret_ty,
+                {sptr_ty, i64, i64, i64, i64, i64, i64}, false);
+        sptr_ret_idx = 0;
+
+        nfn = llvm::Function::Create(fn_ty, linkage, fn->getName() + "_lp64", mod);
+        nfn->copyAttributesFrom(fn);
+        llvm::AttributeList al = nfn->getAttributes();
+#if LL_LLVM_MAJOR < 14
+        al = al.addParamAttributes(ctx, 0, al.getParamAttributes(0));
+#else
+        llvm::AttrBuilder ab(ctx, al.getParamAttrs(0));
+        al = al.addParamAttributes(ctx, 0, ab);
+#endif
+        nfn->setAttributes(al.removeParamAttributes(ctx, 0));
+        sptr = &nfn->arg_begin()[0];
+
+        if (call_fn_cdecl) {
+            tail_fn = llvm::cast<llvm::Function>(mod->getOrInsertFunction("instrew_quick_dispatch", fn_ty).getCallee());
+            tail_fn->copyAttributesFrom(nfn);
+            tail_fn->setDSOLocal(true);
+            call_fn = tail_fn;
+        }
+        break;
+    }
+    case CallConv::RV64_RV64_LP64: {
+        static constexpr SptrField lp64_fields[] = {
+            { SptrFields::rv64::RIP,  1,  1  },
+            { SptrFields::rv64::X10,  2,  2  },
+            { SptrFields::rv64::X11,  3,  3  },
+            { SptrFields::rv64::X12,  4,  4  },
+            { SptrFields::rv64::X13,  5,  5  },
+            { SptrFields::rv64::X14,  6,  6  },
+        };
+        static const constexpr SptrFieldMap lp64_fieldmap = CreateSptrMap(lp64_fields);
+        fields = lp64_fields;
+        fieldmap = &lp64_fieldmap;
+        goto callconv_lp64_common;
+    }
+    case CallConv::AARCH64_RV64_LP64: {
+        static constexpr SptrField lp64_fields[] = {
+            { SptrFields::aarch64::PC,  1,  1  },
+            { SptrFields::aarch64::X0,  2,  2  },
+            { SptrFields::aarch64::X1,  3,  3  },
+            { SptrFields::aarch64::X2,  4,  4  },
+            { SptrFields::aarch64::X3,  5,  5  },
+            { SptrFields::aarch64::X4,  6,  6  },
+        };
+        static const constexpr SptrFieldMap lp64_fieldmap = CreateSptrMap(lp64_fields);
+        fields = lp64_fields;
+        fieldmap = &lp64_fieldmap;
+        goto callconv_lp64_common;
+    }
     case CallConv::CDECL:
     default:
         assert(false && "unsupported Instrew calling convention!");

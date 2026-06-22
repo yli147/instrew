@@ -458,6 +458,177 @@ dispatch_aapcsx_fullresolve:
 
 #endif // defined(__aarch64__)
 
+#if defined(__riscv)
+
+// RISC-V LP64 dispatcher (A1' design). Physical register layout after
+// LLVM's sret lowering of the 7-element return struct:
+//   a0 = sret pointer (points to a 7-i64 slot; unused by dispatcher)
+//   a1 = sptr (regdata pointer) - persists through translated code
+//   a2 = PC (arg 1, mapped to guest PC/RIP)
+//   a3..a7 = 5 additional packed guest regs (guest-specific mapping;
+//   see SptrFields in server/callconv.cc)
+//
+// patch_data_reg = t6 (x31). No SwiftSelf: LLVM RISC-V ignores it.
+
+void dispatch_lp64();
+void dispatch_lp64_fullresolve();
+
+// Hot loop, called with a0..a7 already in position (via C ABI).
+extern void dispatch_lp64_hot(void* sret_slot, uint64_t* cpu_regs,
+                              uint64_t a2_pc, uint64_t a3, uint64_t a4,
+                              uint64_t a5, uint64_t a6, uint64_t a7);
+
+// Entry: figure out guest-specific initial values for a2..a7, then
+// call into the hot loop with sret slot pre-allocated on the stack.
+static void
+dispatch_lp64_loop(uint64_t* cpu_regs) {
+    struct CpuState* cpu_state = CPU_STATE_FROM_REGS(cpu_regs);
+    unsigned guest_arch = cpu_state->state->tsc.tsc_guest_arch;
+    // Byte offsets into regdata for the 6 in-reg guest regs (PC + 5).
+    // Field mapping mirrors server/callconv.cc CallConv::*_RV64_LP64.
+    uint64_t off[6] = {0};
+    if (guest_arch == EM_X86_64) {
+        // RIP, RAX, RCX, RDX, RBX, RSP
+        off[0] = 0;  off[1] = 8;  off[2] = 16; off[3] = 24;
+        off[4] = 32; off[5] = 40;
+    } else if (guest_arch == EM_RISCV) {
+        // RIP, X10, X11, X12, X13, X14
+        off[0] = 0;  off[1] = 88;  off[2] = 96;  off[3] = 104;
+        off[4] = 112; off[5] = 120;
+    } else if (guest_arch == EM_AARCH64) {
+        // PC, X0, X1, X2, X3, X4
+        off[0] = 0;  off[1] = 16; off[2] = 24; off[3] = 32;
+        off[4] = 40; off[5] = 48;
+    }
+    uint8_t* r = (uint8_t*) cpu_regs;
+    uint64_t sret_slot[7];  // matches LLVM 7-element ret struct
+    dispatch_lp64_hot(sret_slot, cpu_regs,
+                      *(uint64_t*)(r + off[0]),
+                      *(uint64_t*)(r + off[1]),
+                      *(uint64_t*)(r + off[2]),
+                      *(uint64_t*)(r + off[3]),
+                      *(uint64_t*)(r + off[4]),
+                      *(uint64_t*)(r + off[5]));
+}
+
+ASM_BLOCK(
+    // dispatch_lp64: quick-TLB tail dispatcher. Tail-called from
+    // translated code at BB boundaries. Physical regs on entry:
+    //   a0=sret_slot, a1=sptr, a2=PC. a3..a7 = packed guest regs.
+    // We stash a1..a7 into the sret slot first, so that any subsequent
+    // fullresolve→ret→dispatch_lp64_hot.Llp64_after_call reload path
+    // sees the current values (translated tail chains bypass the normal
+    // struct-return, so the slot could otherwise be stale).
+    .align 16;
+    .global dispatch_lp64;
+    .type dispatch_lp64, @function;
+dispatch_lp64:
+    sd a1, 0(a0);
+    sd a2, 8(a0);
+    sd a3, 16(a0);
+    sd a4, 24(a0);
+    sd a5, 32(a0);
+    sd a6, 40(a0);
+    sd a7, 48(a0);
+    li t3, ((1 << QUICK_TLB_BITS) - 1) << QUICK_TLB_BITOFF;
+    and t0, a2, t3;
+    add t0, a1, t0;
+    li t3, -CPU_STATE_REGDATA_OFFSET + CPU_STATE_QTLB_OFFSET;
+    add t0, t0, t3;
+    ld t1, 0(t0);
+    ld t2, 8(t0);
+    bne t1, a2, 1f;
+    jr t2;
+1:  mv t6, x0;
+    j dispatch_lp64_fullresolve;
+    .size dispatch_lp64, .-dispatch_lp64;
+
+    // dispatch_lp64_hot: hot loop. On entry a0..a7 already set by C.
+    // s0 keeps the sret slot pointer; a0 (sret ptr) is caller-saved by
+    // the RISC-V ABI, so we reload it after every `jalr`.
+    .align 16;
+    .global dispatch_lp64_hot;
+    .type dispatch_lp64_hot, @function;
+dispatch_lp64_hot:
+    addi sp, sp, -16;
+    sd ra, 0(sp);
+    sd s0, 8(sp);
+    mv s0, a0;
+    j .Llp64_check;
+
+.Llp64_after_call:
+    // Reload sret slot into arg regs. s0 is callee-saved so it survived.
+    mv a0, s0;
+    ld a1, 0(s0);
+    ld a2, 8(s0);
+    ld a3, 16(s0);
+    ld a4, 24(s0);
+    ld a5, 32(s0);
+    ld a6, 40(s0);
+    ld a7, 48(s0);
+.Llp64_check:
+    li t3, ((1 << QUICK_TLB_BITS) - 1) << QUICK_TLB_BITOFF;
+    and t0, a2, t3;
+    add t0, a1, t0;
+    li t3, -CPU_STATE_REGDATA_OFFSET + CPU_STATE_QTLB_OFFSET;
+    add t0, t0, t3;
+    ld t1, 0(t0);
+    ld t2, 8(t0);
+    beq t1, a2, .Llp64_hit;
+    // TLB miss: call the C resolver in-line here so ra points back to
+    // this frame's reload sequence.
+    mv t6, x0;
+    jal dispatch_lp64_fullresolve;
+    jalr t0;
+    j .Llp64_after_call;
+.Llp64_hit:
+    jalr t2;
+    j .Llp64_after_call;
+    .size dispatch_lp64_hot, .-dispatch_lp64_hot;
+
+    // dispatch_lp64_fullresolve: TLB miss → resolve_func in C. Preserves
+    // a0..a7 (sret,sptr,PC,packed) and t6; returns target address in t0.
+    // ret to caller (which will jalr t0 to enter the translated code).
+    .align 16;
+    .global dispatch_lp64_fullresolve;
+    .type dispatch_lp64_fullresolve, @function;
+dispatch_lp64_fullresolve:
+    addi sp, sp, -80;
+    sd ra, 0(sp);
+    sd a0, 8(sp);
+    sd a1, 16(sp);
+    sd a2, 24(sp);
+    sd a3, 32(sp);
+    sd a4, 40(sp);
+    sd a5, 48(sp);
+    sd a6, 56(sp);
+    sd a7, 64(sp);
+    sd t6, 72(sp);
+
+    // resolve_func(cpu_state, addr, patch_data)
+    addi a0, a1, -CPU_STATE_REGDATA_OFFSET; // arg0 = cpu_state
+    mv a1, a2;                              // arg1 = addr (PC)
+    mv a2, t6;                              // arg2 = patch_data
+    jal resolve_func;
+    mv t0, a0;                              // save target (a-reg → t-reg)
+
+    ld ra, 0(sp);
+    ld a0, 8(sp);
+    ld a1, 16(sp);
+    ld a2, 24(sp);
+    ld a3, 32(sp);
+    ld a4, 40(sp);
+    ld a5, 48(sp);
+    ld a6, 56(sp);
+    ld a7, 64(sp);
+    ld t6, 72(sp);
+    addi sp, sp, 80;
+    ret;
+    .size dispatch_lp64_fullresolve, .-dispatch_lp64_fullresolve;
+);
+
+#endif // defined(__riscv)
+
 const struct DispatcherInfo*
 dispatch_get(struct State* state) {
     static const struct DispatcherInfo infos[] = {
@@ -489,6 +660,14 @@ dispatch_get(struct State* state) {
             .patch_data_reg = 16, // x16
         },
 #endif // defined(__aarch64__)
+#if defined(__riscv)
+        [4] = {
+            .loop_func = dispatch_lp64_loop,
+            .quick_dispatch_func = (uintptr_t) dispatch_lp64,
+            .full_dispatch_func = (uintptr_t) dispatch_lp64_fullresolve,
+            .patch_data_reg = 31, // t6
+        },
+#endif // defined(__riscv)
     };
 
     unsigned callconv = state->tc.tc_callconv;

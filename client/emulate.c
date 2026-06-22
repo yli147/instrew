@@ -14,6 +14,11 @@
 #include <state.h>
 #include <translator.h>
 
+// RISC-V does not have __NR_renameat, use renameat2 with flags=0
+#ifndef __NR_renameat
+#define __NR_renameat __NR_renameat2
+#endif
+
 
 // SIG_DFL should be zero, so zero-initializing sigact is sufficient
 // Unfortunately, this is not an integer constant expression.
@@ -244,7 +249,7 @@ handle_clone(struct State* state, struct clone_args* uargs, size_t usize) {
     // clone(flags, stack, parent_tid, child_tid, tls)
     ssize_t res = syscall(__NR_clone, flags, 0, args.parent_tid, args.child_tid,
                           args.tls, 0);
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__riscv)
     // clone(flags, stack, parent_tid, tls, child_tid)
     ssize_t res = syscall(__NR_clone, flags, 0, args.parent_tid, args.tls,
                           args.child_tid, 0);
