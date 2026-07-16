@@ -17,18 +17,24 @@
 
 #define MEM_BASE ((void*) 0x0000400000000000ull)
 #define MEM_CODE_SIZE 0x40000000
-#define MEM_DATA_SIZE 0x01000000
+#define MEM_DATA_SIZE 0x08000000
 
 typedef struct Arena Arena;
 struct Arena {
     char* start;
     char* end;
+    // brk/brkp accessed via __atomic_* builtins (pointer-width word).
+    // brk: atomic bump pointer — claimed by CAS in arena_alloc.
+    // brkp: high-water mark of OS-backed pages — advanced under mprotect_lock.
     char* brk;
     char* brkp;
+    // 0 = unlocked, 1 = locked. Only held during mprotect (rare path).
+    int mprotect_lock;
+    bool exec;
 };
 
 static int
-arena_init(Arena* arena, void* base, size_t size) {
+arena_init(Arena* arena, void* base, size_t size, bool exec) {
     void* mem = mmap(base, size, PROT_NONE,
                      MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     if (BAD_ADDR(mem))
@@ -36,33 +42,68 @@ arena_init(Arena* arena, void* base, size_t size) {
 
     arena->start = mem;
     arena->end = (char*) mem + size;
-    arena->brk = mem;
-    arena->brkp = mem;
-
+    __atomic_store_n(&arena->brk,  (char*) mem, __ATOMIC_RELAXED);
+    __atomic_store_n(&arena->brkp, (char*) mem, __ATOMIC_RELAXED);
+    __atomic_store_n(&arena->mprotect_lock, 0, __ATOMIC_RELAXED);
+    arena->exec = exec;
     return 0;
 }
 
+// Slow path: make sure [result, result+size) is backed by mprotect.
+// Called after the bump pointer has already reserved the space.
+static void
+arena_ensure_backed(Arena* arena, char* result, size_t size) {
+    char* need_end = result + size;
+
+    // Check if the region is already backed (fast path, no lock needed).
+    if (need_end <= __atomic_load_n(&arena->brkp, __ATOMIC_ACQUIRE))
+        return;
+
+    // Slow path: take lock and extend brkp.
+    int exp = 0;
+    while (!__atomic_compare_exchange_n(&arena->mprotect_lock, &exp, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        exp = 0;
+
+    // Re-check under lock: another thread may have extended brkp already.
+    char* cur_brkp;
+    __atomic_load(&arena->brkp, &cur_brkp, __ATOMIC_RELAXED);
+    if (need_end > cur_brkp) {
+        size_t newpgsz = ALIGN_UP((size_t)(need_end - cur_brkp), getpagesize());
+        int prot = PROT_READ|PROT_WRITE | (arena->exec ? PROT_EXEC : 0);
+        mprotect(cur_brkp, newpgsz, prot);
+        char* new_brkp = cur_brkp + newpgsz;
+        __atomic_store_n(&arena->brkp, new_brkp, __ATOMIC_RELEASE);
+    }
+
+    __atomic_store_n(&arena->mprotect_lock, 0, __ATOMIC_RELEASE);
+}
+
 static void*
-arena_alloc(Arena* arena, size_t size, size_t alignment, bool exec) {
+arena_alloc(Arena* arena, size_t size, size_t alignment) {
     if (alignment < 0x40)
         alignment = 0x40;
     if (alignment & (alignment - 1))
         return (void*) (uintptr_t) -EINVAL;
-    char* brk_al = (char*) ALIGN_UP((uintptr_t) arena->brk, alignment);
-    if (brk_al + size <= arena->brkp) { // easy case.
-        arena->brk = brk_al + size;
-        return brk_al;
-    }
-    size_t newpgsz = ALIGN_UP(size - (arena->brkp - brk_al), getpagesize());
-    if (arena->brk + newpgsz > arena->end)
-        return (void*) (uintptr_t) -ENOMEM;
-    int prot = PROT_READ|PROT_WRITE | (exec ? PROT_EXEC : 0);
-    int ret = mprotect(arena->brkp, newpgsz, prot);
-    if (ret < 0)
-        return (void*) (uintptr_t) ret;
-    arena->brkp += newpgsz;
-    arena->brk = brk_al + size;
-    return brk_al;
+
+    // Atomically bump brk to claim [result, result+size).
+    // CAS loop: read current brk, align it, add size, CAS to new value.
+    char* old_brk;
+    char* new_brk;
+    char* result;
+    do {
+        old_brk = __atomic_load_n(&arena->brk, __ATOMIC_RELAXED);
+        result  = (char*) ALIGN_UP((uintptr_t) old_brk, alignment);
+        new_brk = result + size;
+        if (new_brk > arena->end)
+            return (void*) (uintptr_t) -ENOMEM;
+    } while (!__atomic_compare_exchange_n(&arena->brk, &old_brk, new_brk,
+                                          /*weak=*/1,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    // Ensure the pages we claimed are backed by the OS.
+    arena_ensure_backed(arena, result, size);
+    return result;
 }
 
 Arena main_arena_code;
@@ -70,11 +111,11 @@ Arena main_arena_data;
 
 int
 mem_init(void) {
-    int ret = arena_init(&main_arena_data, MEM_BASE, MEM_DATA_SIZE);
+    int ret = arena_init(&main_arena_data, MEM_BASE, MEM_DATA_SIZE, /*exec=*/false);
     if (ret)
         return ret;
     void* code_arena_base = (void*) ((uintptr_t) MEM_BASE + MEM_DATA_SIZE);
-    ret = arena_init(&main_arena_code, code_arena_base, MEM_CODE_SIZE);
+    ret = arena_init(&main_arena_code, code_arena_base, MEM_CODE_SIZE, /*exec=*/true);
     if (ret)
         return ret;
     return 0;
@@ -82,12 +123,12 @@ mem_init(void) {
 
 void*
 mem_alloc_data(size_t size, size_t alignment) {
-    return arena_alloc(&main_arena_data, size, alignment, /*exec=*/false);
+    return arena_alloc(&main_arena_data, size, alignment);
 }
 
 void*
 mem_alloc_code(size_t size, size_t alignment) {
-    return arena_alloc(&main_arena_code, size, alignment, /*exec=*/true);
+    return arena_alloc(&main_arena_code, size, alignment);
 }
 
 int

@@ -80,7 +80,7 @@ public:
             // PC-relative ±2GB — the code and its constant pool sit in
             // the same arena, so this is comfortably in range.
             cm = llvm::CodeModel::Medium;
-            // Enable the base extensions of RV64GC (a.k.a. rv64imafdc).
+            // Enable the base extensions of RV64GC (a.k.a. rv64gcv).
             // Without +m, LLVM emits libcalls (__muldi3, __divdi3, ...)
             // that the minilibc client doesn't provide.
             features = "+m,+a,+f,+d,+c,+v,+zve64d";

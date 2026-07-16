@@ -24,14 +24,16 @@ int main(int argc, char** argv) {
     // Initialize state.
     struct State state = {0};
 
-    if (argc < 3) {
-        puts("usage: CONFSTR EXECUTABLE [ARGS...]");
+    // Protocol: [client_binary, socket_fd, sysroot_or_empty, guest_binary, args...]
+    if (argc < 4) {
+        puts("usage: CONFSTR SYSROOT EXECUTABLE [ARGS...]");
         return 1;
     }
 
     char* server_config = argv[1];
-    argc -= 2;
-    argv += 2;
+    const char* sysroot = argv[2]; // "" when -sysroot not passed to server
+    argc -= 3;
+    argv += 3;
 
     signal_init(&state);
 
@@ -42,7 +44,7 @@ int main(int argc, char** argv) {
     }
 
     // Load binary first, because we need to know the architecture.
-    retval = load_elf_binary(argv[0], &info);
+    retval = load_elf_binary(argv[0], sysroot, &info);
     if (retval != 0) {
         puts("error: could not load file");
         return retval;
@@ -96,11 +98,47 @@ int main(int argc, char** argv) {
     // Initialize stack according to ABI
     size_t* stack_top = (size_t*) stack + STACK_SIZE/sizeof(size_t);
 
+    // When -sysroot is set, inject LD_LIBRARY_PATH so the guest dynamic linker
+    // finds x86-64 guest libraries without any modification to the binary.
+    static char sysroot_ldpath[4096];
+    const char* sysroot_ldpath_ptr = NULL;
+    int ldpath_env_index = -1;
+    if (sysroot && sysroot[0]) {
+        const char* existing = NULL;
+        for (int ei = 0; environ[ei]; ei++) {
+            // Find existing LD_LIBRARY_PATH= to preserve it
+            if (environ[ei][0]=='L' && environ[ei][1]=='D' &&
+                environ[ei][2]=='_' && environ[ei][3]=='L' &&
+                environ[ei][4]=='I' && environ[ei][5]=='B' &&
+                environ[ei][6]=='R' && environ[ei][7]=='A' &&
+                environ[ei][8]=='R' && environ[ei][9]=='Y' &&
+                environ[ei][10]=='_' && environ[ei][11]=='P' &&
+                environ[ei][12]=='A' && environ[ei][13]=='T' &&
+                environ[ei][14]=='H' && environ[ei][15]=='=') {
+                existing = environ[ei] + 16;
+                ldpath_env_index = ei;
+            }
+        }
+        if (existing)
+            snprintf(sysroot_ldpath, sizeof(sysroot_ldpath),
+                     "LD_LIBRARY_PATH=%s/usr/lib64:%s/lib64:%s",
+                     sysroot, sysroot, existing);
+        else
+            snprintf(sysroot_ldpath, sizeof(sysroot_ldpath),
+                     "LD_LIBRARY_PATH=%s/usr/lib64:%s/lib64",
+                     sysroot, sysroot);
+        sysroot_ldpath_ptr = sysroot_ldpath;
+    }
+
     // Stack alignment
     int envc = 0;
     while (environ[envc])
         envc++;
-    stack_top -= (argc + envc) & 1; // auxv has even number of entries
+    // If we're replacing an existing LD_LIBRARY_PATH, don't add extra env slot
+    int extra_env = (sysroot_ldpath_ptr && ldpath_env_index < 0) ? 1 : 0;
+    // Number of env slots to allocate: envc - 1 if replacing, envc + 1 if adding
+    int env_slots = envc + extra_env - (ldpath_env_index >= 0 ? 1 : 0);
+    stack_top -= (argc + env_slots) & 1; // auxv has even number of entries
 
     // Set auxiliary values
     *(--stack_top) = 0; // Null auxiliary vector entry
@@ -122,9 +160,19 @@ int main(int argc, char** argv) {
     *(--stack_top) = 0; *(--stack_top) = AT_SECURE;
 
     *(--stack_top) = 0; // End of environment pointers
-    stack_top -= envc;
-    for (i = 0; i < envc; i++)
-        stack_top[i] = (uintptr_t) environ[i];
+    if (sysroot_ldpath_ptr)
+        *(--stack_top) = (uintptr_t) sysroot_ldpath_ptr; // injected LD_LIBRARY_PATH
+    // Allocate space for environment pointers
+    // If replacing, allocate envc-1; if adding, allocate envc
+    int actual_envc = envc - (ldpath_env_index >= 0 && sysroot_ldpath_ptr ? 1 : 0);
+    stack_top -= actual_envc;
+    int dst_idx = 0;
+    for (i = 0; i < envc; i++) {
+        // Skip original LD_LIBRARY_PATH if we're replacing it with sysroot version
+        if (ldpath_env_index >= 0 && i == ldpath_env_index)
+            continue;
+        stack_top[dst_idx++] = (uintptr_t) environ[i];
+    }
     *(--stack_top) = 0; // End of argument pointers
     stack_top -= argc;
     for (i = 0; i < argc; i++)

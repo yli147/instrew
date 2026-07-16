@@ -12,6 +12,9 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassTimingInfo.h>
@@ -84,6 +87,37 @@ static llvm::GlobalVariable* CreatePcBase(llvm::LLVMContext& ctx) {
     llvm::MDNode* node = llvm::MDNode::get(ctx, {lim, lim});
     pc_base_var->setMetadata("absolute_symbol", node);
     return pc_base_var;
+}
+
+// On RISC-V boards where SCOUNTEREN.CY=0, the `rdcycle` CSR read triggered by
+// @llvm.readcyclecounter causes SIGILL in user mode. Replace it with `rdtime`
+// (CSR 0xC01 — wall-clock timer, always user-accessible per the RISC-V spec).
+// This is RISC-V-host-only: x86/AArch64 don't have this restriction.
+static void ReplaceReadCycleCounterWithRdtime(llvm::Function* fn) {
+    llvm::Module* mod = fn->getParent();
+    llvm::LLVMContext& ctx = mod->getContext();
+    llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+
+    llvm::Function* rcc = mod->getFunction("llvm.readcyclecounter");
+    if (!rcc)
+        return;
+
+    llvm::FunctionType* asm_ty = llvm::FunctionType::get(i64, /*vararg=*/false);
+    llvm::InlineAsm* rdtime_asm = llvm::InlineAsm::get(
+        asm_ty, "rdtime $0", "=r", /*hasSideEffects=*/false);
+
+    llvm::SmallVector<llvm::CallInst*, 8> to_replace;
+    for (auto& use : rcc->uses())
+        if (auto* ci = llvm::dyn_cast<llvm::CallInst>(use.getUser()))
+            if (ci->getParent()->getParent() == fn)
+                to_replace.push_back(ci);
+
+    for (auto* ci : to_replace) {
+        llvm::IRBuilder<> irb(ci);
+        llvm::Value* rdtime_val = irb.CreateCall(asm_ty, rdtime_asm);
+        ci->replaceAllUsesWith(rdtime_val);
+        ci->eraseFromParent();
+    }
 }
 
 struct IWState {
@@ -335,6 +369,9 @@ public:
         fn = ChangeCallConv(fn, instrew_cc);
         if (dumpIR.isSet(DumpIR::CC))
             mod->print(llvm::errs(), nullptr);
+
+        if (iwsc->tsc_host_arch == EM_RISCV)
+            ReplaceReadCycleCounterWithRdtime(fn);
 
         auto time_llvm_opt_start = std::chrono::steady_clock::now();
         optimizer.Optimize(fn);

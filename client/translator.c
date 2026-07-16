@@ -65,6 +65,25 @@ int translator_fini(Translator* t) {
     return 0;
 }
 
+// Initialize a translator for a new thread using a pre-existing socket fd
+// obtained via translator_fork_prepare on the parent's translator.
+// Sends C_INIT to the forked server so it enters the normal message loop.
+int translator_thread_init(Translator* t, int fd,
+                           const struct TranslatorServerConfig* tsc) {
+    t->socket = fd;
+    t->written_bytes = 0;
+    t->last_hdr = (TranslatorMsgHdr) {MSGID_UNKNOWN, 0};
+    t->recvbuf = NULL;
+    t->recvbuf_sz = 0;
+
+    int ret;
+    if ((ret = translator_hdr_send(t, MSGID_C_INIT, sizeof *tsc)))
+        return ret;
+    if ((ret = write_full(t->socket, tsc, sizeof *tsc)) != sizeof *tsc)
+        return ret;
+    return 0;
+}
+
 int translator_config_fetch(Translator* t, struct TranslatorConfig* cfg) {
     int32_t sz = translator_hdr_recv(t, MSGID_S_INIT);
     if (sz < 0)
