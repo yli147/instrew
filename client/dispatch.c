@@ -28,7 +28,7 @@ static uint64_t loop_detect_total = 0;
 static uintptr_t same_bb_last_addr = 0;
 static uint64_t same_bb_count = 0;
 static uint64_t same_bb_total_dispatches = 0;  // Total dispatches since last different BB
-#define SAME_BB_THRESHOLD 5000  // Kill after 5k total dispatches in same-BB loop
+#define SAME_BB_THRESHOLD 2000  // Kill after 2k total dispatches in same-BB loop
 
 static void
 loop_detect_check(uintptr_t addr) {
