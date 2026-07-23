@@ -7,6 +7,7 @@
 #include <llvm/Support/CommandLine.h>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -28,6 +29,7 @@ namespace {
 llvm::cl::opt<bool> dumpObjects("dumpobj", llvm::cl::desc("Dump compiled object files"), llvm::cl::Hidden, llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<std::string> Stub("stub", llvm::cl::desc("Path for instrew client stub (default: built-in stub). Only useful for debugging."), llvm::cl::value_desc("instrew-client"), llvm::cl::Hidden, llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<std::string> GuestSysroot("sysroot", llvm::cl::desc("Sysroot for guest dynamic linker and libraries (e.g. /opt/x86-sysroot). Allows running unpatched dynamic x86 binaries without patchelf."), llvm::cl::cat(InstrewCategory));
+llvm::cl::opt<unsigned> heartbeatInterval("heartbeat", llvm::cl::desc("Print heartbeat every N translation requests (0=disabled)"), llvm::cl::init(0), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<std::string> Program(llvm::cl::Positional, llvm::cl::desc("<program>"), llvm::cl::Required);
 llvm::cl::list<std::string> ProgramArgs(llvm::cl::ConsumeAfter, llvm::cl::desc("<arguments>..."));
 
@@ -335,6 +337,11 @@ public:
         if (need_iwcc)
             SendObject(0, "", 0, nullptr); // this will send the client config
 
+        // Heartbeat tracking
+        auto heartbeat_start = std::chrono::steady_clock::now();
+        uint64_t heartbeat_translations = 0;
+        uint64_t heartbeat_cache_hits = 0;
+
         while (true) {
             Msg::Id msgid = conn.RecvMsg();
             if (msgid == Msg::C_EXIT) {
@@ -343,7 +350,26 @@ public:
                 return 0;
             } else if (msgid == Msg::C_TRANSLATE) {
                 auto addr = conn.Read<uint64_t>();
+                auto trans_start = std::chrono::steady_clock::now();
                 fns->translate(state, addr);
+                auto trans_end = std::chrono::steady_clock::now();
+                heartbeat_translations++;
+                auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(trans_end - trans_start).count();
+
+                // Check if we should print heartbeat
+                if (heartbeatInterval && (heartbeat_translations % heartbeatInterval == 0)) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - heartbeat_start).count();
+                    auto rate = (elapsed > 0) ? heartbeat_translations / elapsed : 0;
+                    std::cerr << "[HEARTBEAT] translations=" << heartbeat_translations
+                              << ", elapsed=" << elapsed << "s"
+                              << ", rate=" << rate << "/s"
+                              << ", last_trans=" << dur_ms << "ms"
+                              << ", addr=0x" << std::hex << addr << std::dec
+                              << std::endl;
+                    heartbeat_start = now;
+                    heartbeat_translations = 0;
+                }
             } else if (msgid == Msg::C_FORK) {
                 int child_fds[2];
                 int ret = socketpair(AF_UNIX, SOCK_STREAM, 0, &child_fds[0]);
