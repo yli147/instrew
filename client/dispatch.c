@@ -27,7 +27,7 @@ static uint64_t loop_detect_total = 0;
 // to catch lifters that produce infinite loops (e.g., using stale register values)
 static uintptr_t same_bb_last_addr = 0;
 static uint64_t same_bb_count = 0;
-#define SAME_BB_THRESHOLD 50000  // Kill after 50k consecutive same-BB dispatches
+#define SAME_BB_THRESHOLD 10000  // Kill after 10k consecutive same-BB dispatches
 
 static void
 loop_detect_check(uintptr_t addr) {
