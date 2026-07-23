@@ -27,7 +27,8 @@ static uint64_t loop_detect_total = 0;
 // to catch lifters that produce infinite loops (e.g., using stale register values)
 static uintptr_t same_bb_last_addr = 0;
 static uint64_t same_bb_count = 0;
-#define SAME_BB_THRESHOLD 10000  // Kill after 10k consecutive same-BB dispatches
+static uint64_t same_bb_total_dispatches = 0;  // Total dispatches since last different BB
+#define SAME_BB_THRESHOLD 5000  // Kill after 5k total dispatches in same-BB loop
 
 static void
 loop_detect_check(uintptr_t addr) {
@@ -64,19 +65,23 @@ loop_detect_check(uintptr_t addr) {
     }
     loop_detect_buf[loop_detect_len++] = addr;
 
-    // Same-BB loop detection
+    // Same-BB loop detection - track total dispatches within the "same hot region"
+    // The loop may interleave with other BBs, so we track total dispatches since
+    // we last saw a different "hot" address
     if (addr == same_bb_last_addr) {
         same_bb_count++;
-        if (same_bb_count == SAME_BB_THRESHOLD) {
-            dprintf(2, "\n[SAME-BB-LOOP] Infinite loop detected! Address 0x%lx executed %lu times consecutively (dispatch #%lx)\n",
-                    (unsigned long)addr, (unsigned long)same_bb_count, (unsigned long)loop_detect_total);
-            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic block loops on itself with stale register values\n");
+        same_bb_total_dispatches++;
+        if (same_bb_total_dispatches >= SAME_BB_THRESHOLD) {
+            dprintf(2, "\n[SAME-BB-LOOP] Hot loop detected! Address 0x%lx executed %lu times, %lu total dispatches in region (dispatch #%lx)\n",
+                    (unsigned long)addr, (unsigned long)same_bb_count, (unsigned long)same_bb_total_dispatches, (unsigned long)loop_detect_total);
+            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic block loops with stale register values\n");
             dprintf(2, "[SAME-BB-LOOP] Forcing exit to prevent hang\n");
             _exit(1);
         }
     } else {
         same_bb_last_addr = addr;
         same_bb_count = 1;
+        same_bb_total_dispatches = 1;
     }
 }
 
