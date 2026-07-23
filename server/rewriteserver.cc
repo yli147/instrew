@@ -313,7 +313,13 @@ public:
             auto iwc = reinterpret_cast<IWConnection*>(user_arg);
             return iw_readmem(iwc, addr, addr + bufsz, buf);
         };
-        int fail = ll_func_decode_cfg(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+        // Use decode_block instead of decode_cfg to lift one block at a time.
+        // This prevents internal loops in lifted functions which cause infinite
+        // execution due to stale register values (loop-carried dependencies are
+        // lost when a single lifted function contains a loop back-edge).
+        // With per-block lifting, loops naturally span multiple functions and
+        // each iteration goes through the dispatch loop for proper state save/restore.
+        int fail = ll_func_decode_block(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
         if (fail) {
             std::cerr << "error: decode failed 0x" << std::hex << addr << std::endl;
             ll_func_dispose(rlfn);
