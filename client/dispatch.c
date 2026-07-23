@@ -28,7 +28,7 @@ static uint64_t loop_detect_total = 0;
 static uintptr_t same_bb_last_addr = 0;
 static uint64_t same_bb_consecutive = 0;  // Consecutive repeats of the same BB
 static uint64_t same_bb_total_repeats = 0; // Total repeats across all BBs in the loop
-#define SAME_BB_THRESHOLD 5000  // Kill after 5k total repeats
+#define SAME_BB_THRESHOLD 2000  // Kill after 2k total repeats
 
 static void
 loop_detect_check(uintptr_t addr) {
