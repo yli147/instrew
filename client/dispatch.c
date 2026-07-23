@@ -26,9 +26,9 @@ static uint64_t loop_detect_total = 0;
 // Same-BB loop detector: track consecutive executions of the same translated BB
 // to catch lifters that produce infinite loops (e.g., using stale register values)
 static uintptr_t same_bb_last_addr = 0;
-static uint64_t same_bb_count = 0;
-static uint64_t same_bb_total_dispatches = 0;  // Total dispatches since last different BB
-#define SAME_BB_THRESHOLD 2000  // Kill after 2k total dispatches in same-BB loop
+static uint64_t same_bb_consecutive = 0;  // Consecutive repeats of the same BB
+static uint64_t same_bb_total_repeats = 0; // Total repeats across all BBs in the loop
+#define SAME_BB_THRESHOLD 5000  // Kill after 5k total repeats
 
 static void
 loop_detect_check(uintptr_t addr) {
@@ -65,23 +65,23 @@ loop_detect_check(uintptr_t addr) {
     }
     loop_detect_buf[loop_detect_len++] = addr;
 
-    // Same-BB loop detection - track total dispatches within the "same hot region"
-    // The loop may interleave with other BBs, so we track total dispatches since
-    // we last saw a different "hot" address
+    // Same-BB loop detection - track consecutive repeats
+    // Pattern: A A A A B B B B C C C ... (loop interleaves multiple BBs)
+    // We count consecutive repeats of each BB and sum them up
     if (addr == same_bb_last_addr) {
-        same_bb_count++;
-        same_bb_total_dispatches++;
-        if (same_bb_total_dispatches >= SAME_BB_THRESHOLD) {
-            dprintf(2, "\n[SAME-BB-LOOP] Hot loop detected! Address 0x%lx executed %lu times, %lu total dispatches in region (dispatch #%lx)\n",
-                    (unsigned long)addr, (unsigned long)same_bb_count, (unsigned long)same_bb_total_dispatches, (unsigned long)loop_detect_total);
-            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic block loops with stale register values\n");
+        same_bb_consecutive++;
+        same_bb_total_repeats++;
+        if (same_bb_total_repeats >= SAME_BB_THRESHOLD) {
+            dprintf(2, "\n[SAME-BB-LOOP] Hot loop detected! Current BB 0x%lx has %lu consecutive repeats, %lu total repeats (dispatch #%lx)\n",
+                    (unsigned long)addr, (unsigned long)same_bb_consecutive, (unsigned long)same_bb_total_repeats, (unsigned long)loop_detect_total);
+            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic blocks loop with stale register values\n");
             dprintf(2, "[SAME-BB-LOOP] Forcing exit to prevent hang\n");
             _exit(1);
         }
     } else {
         same_bb_last_addr = addr;
-        same_bb_count = 1;
-        same_bb_total_dispatches = 1;
+        same_bb_consecutive = 1;
+        // Don't reset total_repeats - we want to accumulate across the loop
     }
 }
 
