@@ -313,13 +313,37 @@ public:
             auto iwc = reinterpret_cast<IWConnection*>(user_arg);
             return iw_readmem(iwc, addr, addr + bufsz, buf);
         };
-        // Use decode_block instead of decode_cfg to lift one block at a time.
-        // This prevents internal loops in lifted functions which cause infinite
-        // execution due to stale register values (loop-carried dependencies are
-        // lost when a single lifted function contains a loop back-edge).
-        // With per-block lifting, loops naturally span multiple functions and
-        // each iteration goes through the dispatch loop for proper state save/restore.
-        int fail = ll_func_decode_block(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+        // Hybrid decode strategy: try decode_cfg first (fast, translates entire CFG),
+        // then check for back-edges. If back-edges exist (loops within the lifted
+        // function), fall back to decode_block (safe but slow).
+        // Back-edges cause infinite loops because loop-carried dependencies are lost
+        // when a single lifted function contains a loop - register values become stale.
+        // With per-block lifting, loops span multiple functions and each iteration
+        // goes through the dispatch loop for proper state save/restore.
+        int fail = ll_func_decode_cfg(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+        if (fail) {
+            std::cerr << "error: decode_cfg failed 0x" << std::hex << addr << std::endl;
+            ll_func_dispose(rlfn);
+            iw_sendobj(iwc, addr, nullptr, 0, nullptr);
+            return;
+        }
+        // Check for back-edges (loops) in the decoded CFG
+        if (ll_func_has_back_edges(rlfn)) {
+            // CFG has loops - dispose and retry with per-block decoding
+            if (enableProfiling) {
+                std::cerr << "hybrid: back-edges at 0x" << std::hex << addr
+                          << ", falling back to decode_block" << std::endl;
+            }
+            ll_func_dispose(rlfn);
+            rlfn = ll_func_new(llvm::wrap(mod.get()), rlcfg);
+            fail = ll_func_decode_block(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+            if (fail) {
+                std::cerr << "error: decode_block failed 0x" << std::hex << addr << std::endl;
+                ll_func_dispose(rlfn);
+                iw_sendobj(iwc, addr, nullptr, 0, nullptr);
+                return;
+            }
+        }
         if (fail) {
             std::cerr << "error: decode failed 0x" << std::hex << addr << std::endl;
             ll_func_dispose(rlfn);
