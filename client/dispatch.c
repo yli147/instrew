@@ -21,32 +21,63 @@ uintptr_t resolve_func(struct CpuState*, uintptr_t, struct RtldPatchData*);
 static uintptr_t loop_detect_buf[LOOP_DETECT_WINDOW] = {0};
 static size_t loop_detect_len = 0;
 static uint64_t loop_detect_count = 0;
+static uint64_t loop_detect_total = 0;
+
+// Same-BB loop detector: track consecutive executions of the same translated BB
+// to catch lifters that produce infinite loops (e.g., using stale register values)
+static uintptr_t same_bb_last_addr = 0;
+static uint64_t same_bb_count = 0;
+#define SAME_BB_THRESHOLD 100000  // Kill after 100k consecutive same-BB dispatches
 
 static void
 loop_detect_check(uintptr_t addr) {
+    loop_detect_total++;
+    if (loop_detect_total > 10000000) {
+        // After 10M dispatches, just sample
+        if (loop_detect_total % 1000 != 0) return;
+    }
     if (!loop_detect_len) {
         loop_detect_buf[loop_detect_len++] = addr;
         return;
     }
-    // Check if this address matches the start of the window (indicating a loop)
-    if (loop_detect_len >= 4 && addr == loop_detect_buf[0] && loop_detect_len >= 8) {
+    // Check if this address matches the start of the window
+    if (loop_detect_len >= 4 && addr == loop_detect_buf[0]) {
         loop_detect_count++;
         if (loop_detect_count == 1) {
-            dprintf(2, "\n[LOOP-DETECT] Detected repeating PC sequence (%zu BBs):\n", loop_detect_len);
+            dprintf(2, "\n[LOOP] Loop detected (%lx BBs, dispatch #%lx):\n", (unsigned long)loop_detect_len, loop_detect_total);
             for (size_t i = 0; i < loop_detect_len; i++) {
-                dprintf(2, "  [%zu] 0x%lx\n", i, loop_detect_buf[i]);
+                dprintf(2, "  [%lx] 0x%lx\n", (unsigned long)i, loop_detect_buf[i]);
             }
         }
-        if (loop_detect_count == 10 || (loop_detect_count % 1000 == 0)) {
-            dprintf(2, "[LOOP-DETECT] Loop repeated %lu times\n", loop_detect_count);
+        if (loop_detect_count <= 3 || (loop_detect_count % 10000 == 0)) {
+            dprintf(2, "[LOOP] iter %lx (dispatch #%lx)\n", loop_detect_count, loop_detect_total);
         }
+        // Reset window to start fresh from this point
+        loop_detect_len = 0;
     }
     // Shift window
     if (loop_detect_len >= LOOP_DETECT_WINDOW) {
-        memmove(loop_detect_buf, loop_detect_buf + 1, (LOOP_DETECT_WINDOW - 1) * sizeof(uintptr_t));
+        for (size_t i = 0; i < LOOP_DETECT_WINDOW - 1; i++) {
+            loop_detect_buf[i] = loop_detect_buf[i + 1];
+        }
         loop_detect_len = LOOP_DETECT_WINDOW - 1;
     }
     loop_detect_buf[loop_detect_len++] = addr;
+
+    // Same-BB loop detection
+    if (addr == same_bb_last_addr) {
+        same_bb_count++;
+        if (same_bb_count == SAME_BB_THRESHOLD) {
+            dprintf(2, "\n[SAME-BB-LOOP] Infinite loop detected! Address 0x%lx executed %lu times consecutively (dispatch #%lx)\n",
+                    (unsigned long)addr, (unsigned long)same_bb_count, (unsigned long)loop_detect_total);
+            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic block loops on itself with stale register values\n");
+            dprintf(2, "[SAME-BB-LOOP] Forcing exit to prevent hang\n");
+            _exit(1);
+        }
+    } else {
+        same_bb_last_addr = addr;
+        same_bb_count = 1;
+    }
 }
 
 static void
@@ -55,23 +86,20 @@ print_trace(struct CpuState* cpu_state, uintptr_t addr) {
     dprintf(2, "Trace 0x%lx\n", addr);
     loop_detect_check(addr);
     if (cpu_state->state->tc.tc_print_regs) {
-        dprintf(2, "  RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n",
+        dprintf(2, "  RAX=%lx RBX=%lx RCX=%lx RDX=%lx\n",
                 cpu_regs[1], cpu_regs[4], cpu_regs[2], cpu_regs[3]);
-        dprintf(2, "  RSI=%016lx RDI=%016lx RBP=%016lx RSP=%016lx\n",
+        dprintf(2, "  RSI=%lx RDI=%lx RBP=%lx RSP=%lx\n",
                 cpu_regs[7], cpu_regs[8], cpu_regs[6], cpu_regs[5]);
-        dprintf(2, "  R8 =%016lx R9 =%016lx R10=%016lx R11=%016lx\n",
-                cpu_regs[9], cpu_regs[10], cpu_regs[11], cpu_regs[12]);
-        dprintf(2, "  R12=%016lx R13=%016lx R14=%016lx R15=%016lx\n",
-                cpu_regs[13], cpu_regs[14], cpu_regs[15], cpu_regs[16]);
-        dprintf(2, "  RIP=%016lx\n", addr);
+        dprintf(2, "  RIP=%lx\n", addr);
+        // Print XMM registers only when loop is detected (first 3 iterations)
         if (loop_detect_count >= 1 && loop_detect_count <= 3) {
-            dprintf(2, "  XMM0=%016lx:%016lx XMM1=%016lx:%016lx\n",
+            dprintf(2, "  XMM0=%lx:%lx XMM1=%lx:%lx\n",
                     cpu_regs[18], cpu_regs[19], cpu_regs[20], cpu_regs[21]);
-            dprintf(2, "  XMM2=%016lx:%016lx XMM3=%016lx:%016lx\n",
+            dprintf(2, "  XMM2=%lx:%lx XMM3=%lx:%lx\n",
                     cpu_regs[22], cpu_regs[23], cpu_regs[24], cpu_regs[25]);
-            dprintf(2, "  XMM4=%016lx:%016lx XMM5=%016lx:%016lx\n",
+            dprintf(2, "  XMM4=%lx:%lx XMM5=%lx:%lx\n",
                     cpu_regs[26], cpu_regs[27], cpu_regs[28], cpu_regs[29]);
-            dprintf(2, "  XMM6=%016lx:%016lx XMM7=%016lx:%016lx\n",
+            dprintf(2, "  XMM6=%lx:%lx XMM7=%lx:%lx\n",
                     cpu_regs[30], cpu_regs[31], cpu_regs[32], cpu_regs[33]);
         }
     }
