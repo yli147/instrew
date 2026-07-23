@@ -16,20 +16,64 @@
 // dispatcher on x86-64 below.
 uintptr_t resolve_func(struct CpuState*, uintptr_t, struct RtldPatchData*);
 
+// Loop detector: track recent PC sequence to detect infinite loops
+#define LOOP_DETECT_WINDOW 64
+static uintptr_t loop_detect_buf[LOOP_DETECT_WINDOW] = {0};
+static size_t loop_detect_len = 0;
+static uint64_t loop_detect_count = 0;
+
+static void
+loop_detect_check(uintptr_t addr) {
+    if (!loop_detect_len) {
+        loop_detect_buf[loop_detect_len++] = addr;
+        return;
+    }
+    // Check if this address matches the start of the window (indicating a loop)
+    if (loop_detect_len >= 4 && addr == loop_detect_buf[0] && loop_detect_len >= 8) {
+        loop_detect_count++;
+        if (loop_detect_count == 1) {
+            dprintf(2, "\n[LOOP-DETECT] Detected repeating PC sequence (%zu BBs):\n", loop_detect_len);
+            for (size_t i = 0; i < loop_detect_len; i++) {
+                dprintf(2, "  [%zu] 0x%lx\n", i, loop_detect_buf[i]);
+            }
+        }
+        if (loop_detect_count == 10 || (loop_detect_count % 1000 == 0)) {
+            dprintf(2, "[LOOP-DETECT] Loop repeated %lu times\n", loop_detect_count);
+        }
+    }
+    // Shift window
+    if (loop_detect_len >= LOOP_DETECT_WINDOW) {
+        memmove(loop_detect_buf, loop_detect_buf + 1, (LOOP_DETECT_WINDOW - 1) * sizeof(uintptr_t));
+        loop_detect_len = LOOP_DETECT_WINDOW - 1;
+    }
+    loop_detect_buf[loop_detect_len++] = addr;
+}
+
 static void
 print_trace(struct CpuState* cpu_state, uintptr_t addr) {
     uint64_t* cpu_regs = (uint64_t*) cpu_state->regdata;
     dprintf(2, "Trace 0x%lx\n", addr);
+    loop_detect_check(addr);
     if (cpu_state->state->tc.tc_print_regs) {
-        dprintf(2, "RAX=%lx RBX=%lx RCX=%lx RDX=%lx\n", cpu_regs[1], cpu_regs[4], cpu_regs[2], cpu_regs[3]);
-        dprintf(2, "RSI=%lx RDI=%lx RBP=%lx RSP=%lx\n", cpu_regs[7], cpu_regs[8], cpu_regs[6], cpu_regs[5]);
-        dprintf(2, "R8 =%lx R9 =%lx R10=%lx R11=%lx\n", cpu_regs[9], cpu_regs[10], cpu_regs[11], cpu_regs[12]);
-        dprintf(2, "R12=%lx R13=%lx R14=%lx R15=%lx\n", cpu_regs[13], cpu_regs[14], cpu_regs[15], cpu_regs[16]);
-        dprintf(2, "RIP=%lx\n", addr);
-        dprintf(2, "XMM0=%lx:%lx XMM1=%lx:%lx\n", cpu_regs[18], cpu_regs[19], cpu_regs[20], cpu_regs[21]);
-        dprintf(2, "XMM2=%lx:%lx XMM3=%lx:%lx\n", cpu_regs[22], cpu_regs[23], cpu_regs[24], cpu_regs[25]);
-        dprintf(2, "XMM4=%lx:%lx XMM5=%lx:%lx\n", cpu_regs[26], cpu_regs[27], cpu_regs[28], cpu_regs[29]);
-        dprintf(2, "XMM6=%lx:%lx XMM7=%lx:%lx\n", cpu_regs[30], cpu_regs[31], cpu_regs[32], cpu_regs[33]);
+        dprintf(2, "  RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n",
+                cpu_regs[1], cpu_regs[4], cpu_regs[2], cpu_regs[3]);
+        dprintf(2, "  RSI=%016lx RDI=%016lx RBP=%016lx RSP=%016lx\n",
+                cpu_regs[7], cpu_regs[8], cpu_regs[6], cpu_regs[5]);
+        dprintf(2, "  R8 =%016lx R9 =%016lx R10=%016lx R11=%016lx\n",
+                cpu_regs[9], cpu_regs[10], cpu_regs[11], cpu_regs[12]);
+        dprintf(2, "  R12=%016lx R13=%016lx R14=%016lx R15=%016lx\n",
+                cpu_regs[13], cpu_regs[14], cpu_regs[15], cpu_regs[16]);
+        dprintf(2, "  RIP=%016lx\n", addr);
+        if (loop_detect_count >= 1 && loop_detect_count <= 3) {
+            dprintf(2, "  XMM0=%016lx:%016lx XMM1=%016lx:%016lx\n",
+                    cpu_regs[18], cpu_regs[19], cpu_regs[20], cpu_regs[21]);
+            dprintf(2, "  XMM2=%016lx:%016lx XMM3=%016lx:%016lx\n",
+                    cpu_regs[22], cpu_regs[23], cpu_regs[24], cpu_regs[25]);
+            dprintf(2, "  XMM4=%016lx:%016lx XMM5=%016lx:%016lx\n",
+                    cpu_regs[26], cpu_regs[27], cpu_regs[28], cpu_regs[29]);
+            dprintf(2, "  XMM6=%016lx:%016lx XMM7=%016lx:%016lx\n",
+                    cpu_regs[30], cpu_regs[31], cpu_regs[32], cpu_regs[33]);
+        }
     }
 }
 
@@ -477,6 +521,10 @@ void dispatch_lp64_fullresolve();
 extern void dispatch_lp64_hot(void* sret_slot, uint64_t* cpu_regs,
                               uint64_t a2_pc, uint64_t a3, uint64_t a4,
                               uint64_t a5, uint64_t a6, uint64_t a7);
+
+// Execution heartbeat counter - prints every N dispatches to stderr
+static volatile uint64_t exec_heartbeat_counter = 0;
+#define EXEC_HEARTBEAT_INTERVAL 1000000  // 1 million dispatches
 
 // Entry: figure out guest-specific initial values for a2..a7, then
 // call into the hot loop with sret slot pre-allocated on the stack.

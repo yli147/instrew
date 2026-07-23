@@ -44,6 +44,7 @@ enum class DumpIR {
 
 llvm::cl::opt<bool> enableProfiling("profile", llvm::cl::desc("Profile translation"), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<bool> enableTracing("trace", llvm::cl::desc("Trace execution (lots of logs)"), llvm::cl::cat(InstrewCategory));
+llvm::cl::opt<bool> enableTraceRegs("trace-regs", llvm::cl::desc("Print register state on each trace"), llvm::cl::init(false), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<unsigned char> perfSupport("perf", llvm::cl::desc("Enable perf support:"),
     llvm::cl::values(
         clEnumVal(0, "disabled"),
@@ -232,6 +233,7 @@ public:
         iwcc->tc_profile = enableProfiling;
         iwcc->tc_perf = perfSupport;
         iwcc->tc_print_trace = enableTracing;
+        iwcc->tc_print_regs = enableTraceRegs || enableTracing;
 
         llvm::GlobalVariable* pc_base_var = CreatePcBase(ctx);
         pc_base = llvm::ConstantExpr::getPtrToInt(pc_base_var,
