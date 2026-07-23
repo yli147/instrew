@@ -29,9 +29,13 @@
 #include <deque>
 #include <dlfcn.h>
 #include <elf.h>
+#include <execinfo.h>
 #include <fstream>
 #include <iostream>
+#include <signal.h>
 #include <unistd.h>
+#include <algorithm>
+#include <iomanip>
 #include <sstream>
 #include <unordered_map>
 
@@ -301,6 +305,7 @@ public:
     }
 
     void Translate(uintptr_t addr) {
+        last_translating_addr = addr;
         auto time_predecode_start = std::chrono::steady_clock::now();
 
         // Optionally generate position-independent code, where the offset
@@ -366,7 +371,16 @@ public:
         }
 
         llvm::Function* fn = llvm::unwrap<llvm::Function>(fn_wrapped);
-        fn->setName("S0_" + llvm::Twine::utohexstr(addr));
+        // Encode address in octal so the client's rtld_elf_decode_name can parse it.
+        // Client expects names like "S<octal_digits>" where octal digits are 0-7 only.
+        std::string octal_addr;
+        uint64_t a = addr;
+        do {
+            octal_addr += '0' + (a & 7);
+            a >>= 3;
+        } while (a);
+        std::reverse(octal_addr.begin(), octal_addr.end());
+        fn->setName("S" + octal_addr);
         ll_func_dispose(rlfn);
 
         if (dumpIR.isSet(DumpIR::Lift))
@@ -409,7 +423,41 @@ public:
 };
 
 
+static uintptr_t last_translating_addr = 0;
+
+static void CrashHandler(int sig, siginfo_t* info, void* ucp) {
+    // Force flush stderr
+    fflush(stderr);
+    fprintf(stderr, "\n*** SERVER CRASHED (signal %d) while translating 0x%012lx ***\n", sig, (unsigned long)last_translating_addr);
+    if (info) {
+        fprintf(stderr, "  Fault address: %p\n", info->si_addr);
+    }
+    void* buffer[64];
+    int nptrs = backtrace(buffer, 64);
+    char** syms = backtrace_symbols(buffer, nptrs);
+    if (syms) {
+        for (int i = 0; i < nptrs; i++)
+            fprintf(stderr, "  [%d] %s\n", i, syms[i]);
+        free(syms);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    _exit(139);
+}
+
 int main(int argc, char** argv) {
+    // Install crash handler for debugging
+    struct sigaction sa;
+    sa.sa_sigaction = CrashHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+
+    // Disable stderr buffering so crash messages appear immediately
+    setbuf(stderr, NULL);
+
     llvm::cl::HideUnrelatedOptions({&InstrewCategory, &CodeGenCategory});
     auto& optionMap = llvm::cl::getRegisteredOptions();
     optionMap["time-passes"]->setHiddenFlag(llvm::cl::Hidden);
