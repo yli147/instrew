@@ -18,6 +18,9 @@ enum class CallConv {
     AARCH64_X86_REGCALL,
     X86_AARCH64_X,
     AARCH64_AARCH64_X,
+    X86_RV64_LP64,
+    RV64_RV64_LP64,
+    AARCH64_RV64_LP64,
 };
 
 CallConv GetFastCC(int host_arch, int guest_arch);

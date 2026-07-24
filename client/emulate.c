@@ -1,18 +1,29 @@
 
 #include <common.h>
 
+#include <dispatch.h>
+#include <dispatcher-info.h>
+#include <elf.h>
 #include <emulate.h>
+#include <memory.h>
+#include <rtld.h>
 
 #include <asm/sigcontext.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
 #include <asm/stat.h>
 #include <asm/ucontext.h>
+#include <linux/mman.h>
 #include <linux/sched.h>
 #include <linux/utsname.h>
 
 #include <state.h>
 #include <translator.h>
+
+// RISC-V does not have __NR_renameat, use renameat2 with flags=0
+#ifndef __NR_renameat
+#define __NR_renameat __NR_renameat2
+#endif
 
 
 // SIG_DFL should be zero, so zero-initializing sigact is sufficient
@@ -194,6 +205,23 @@ signal_init(struct State* state) {
     sigaction(SIGBUS, &act, NULL);
 }
 
+// Arguments passed from the creating thread to the new guest thread.
+// Placed at the top of the host stack so __clone can find them.
+struct ThreadStartArgs {
+    struct CpuState* cpu_state;
+    const struct DispatcherInfo* disp_info;
+};
+
+// Entry function for every new guest thread. Called by __clone's child path.
+// Sets up TP to point to this thread's CpuState, then enters dispatch loop.
+static int
+thread_entry(void* arg) {
+    struct ThreadStartArgs* tsa = (struct ThreadStartArgs*) arg;
+    set_thread_area(tsa->cpu_state);
+    tsa->disp_info->loop_func((uint64_t*) tsa->cpu_state->regdata);
+    return 0; // unreachable — loop_func never returns
+}
+
 static int
 handle_clone(struct State* state, struct clone_args* uargs, size_t usize) {
     struct clone_args args = {0};
@@ -205,13 +233,147 @@ handle_clone(struct State* state, struct clone_args* uargs, size_t usize) {
     }
 
     if (args.flags & CLONE_VM) {
-        static bool warned_clone_vm = false;
-        if (!warned_clone_vm) {
-            dprintf(2, "unhandled syscall clone(CLONE_VM|..., ...) = -EOPNOTSUPP"
-                    " -- multi-threading is currently not implemented\n");
-            warned_clone_vm = true;
+        // --- Thread creation (CLONE_VM) ---
+        // Each thread gets its own CpuState (registers, quick TLB) and its
+        // own State (translator socket, rtld). They share the host address
+        // space but the JIT code arena is thread-safe via arena_spinlock.
+        struct CpuState* parent_cs = get_thread_area();
+        const struct DispatcherInfo* disp_info = dispatch_get(state);
+        if (!disp_info)
+            return -EOPNOTSUPP;
+
+        // 1. Allocate child CpuState; copy parent registers as starting point.
+        struct CpuState* child_cs =
+            mem_alloc_data(sizeof(*child_cs), _Alignof(*child_cs));
+        if (BAD_ADDR(child_cs))
+            return -ENOMEM;
+        memset(child_cs, 0, sizeof(*child_cs));
+        child_cs->self = child_cs;
+        child_cs->sigmask = parent_cs->sigmask;
+        memcpy(child_cs->regdata, parent_cs->regdata, sizeof(parent_cs->regdata));
+
+        // 2. Allocate and initialize child State (own translator + own rtld).
+        struct State* child_state =
+            mem_alloc_data(sizeof(*child_state), _Alignof(*child_state));
+        if (BAD_ADDR(child_state))
+            return -ENOMEM;
+        memcpy(child_state, state, sizeof(*child_state));
+        child_cs->state = child_state;
+
+        // 3. Connect new translator for the child thread (each thread needs
+        //    its own socket — sharing would interleave request/response frames).
+        //    translator_fork_prepare sends C_FORK and receives a new socket fd
+        //    from the server. translator_thread_init sends C_INIT on that fd
+        //    so the forked server enters its normal message-handling loop.
+        int new_fd = translator_fork_prepare(&state->translator);
+        if (new_fd < 0)
+            return new_fd;
+        int tret = translator_thread_init(&child_state->translator, new_fd,
+                                          &child_state->tsc);
+        if (tret < 0) {
+            close(new_fd);
+            return tret;
         }
-        return -EOPNOTSUPP;
+
+        // 4. Initialize child rtld and load the initial dispatch object.
+        //    Protocol: C_INIT → S_INIT (translator_config_fetch) → S_OBJECT.
+        //    Must read S_INIT before S_OBJECT or the socket gets out of sync.
+        int ret = translator_config_fetch(&child_state->translator,
+                                          &child_state->tc);
+        if (ret < 0)
+            return ret;
+
+        ret = rtld_init(&child_state->rtld, disp_info);
+        if (ret < 0) {
+            close(new_fd);
+            return ret;
+        }
+        ret = rtld_perf_init(&child_state->rtld, child_state->tc.tc_perf);
+        (void) ret; // perf init failure is non-fatal
+
+        void* initobj;
+        size_t initobj_size;
+        ret = translator_get_object(&child_state->translator, &initobj,
+                                    &initobj_size);
+        if (ret < 0)
+            return ret;
+        if (initobj_size > 0) {
+            ret = rtld_add_object(&child_state->rtld, initobj, initobj_size, 0);
+            if (ret < 0)
+                return ret;
+        }
+
+        // 5. Set guest stack pointer, TLS, and clone return value (0) in child.
+        //
+        // Layout is GUEST ISA (from callconv.cc / dispatch.c trace output),
+        // independent of host ISA. On RISC-V host running x86-64 guest we must
+        // use the x86-64 offsets, NOT the host RISC-V offsets.
+        //   x86-64 guest: [0]=RIP [1]=RAX [5]=RSP [18]=FS_BASE
+        //   AArch64 guest: [0]=PC [2]=X0 [33]=SP
+        //   RISC-V guest:  [0]=PC [11]=a0 [3]=X2/SP
+        //
+        // For clone (case 56) args.stack is already the RSP (top of stack).
+        // For clone3 (case 435) args.stack is the BASE; RSP = stack + stack_size.
+        uint64_t child_rsp = (args.stack_size > 0)
+            ? args.stack + args.stack_size
+            : args.stack;
+
+        unsigned guest_arch = state->tsc.tsc_guest_arch;
+        if (guest_arch == EM_X86_64) {
+            ((uint64_t*) child_cs->regdata)[1]  = 0;         // RAX = 0
+            ((uint64_t*) child_cs->regdata)[5]  = child_rsp; // RSP
+            ((uint64_t*) child_cs->regdata)[18] = args.tls;  // FS_BASE
+        } else if (guest_arch == EM_AARCH64) {
+            ((uint64_t*) child_cs->regdata)[2]  = 0;         // X0 = 0
+            ((uint64_t*) child_cs->regdata)[33] = child_rsp; // SP
+        } else if (guest_arch == EM_RISCV) {
+            ((uint64_t*) child_cs->regdata)[11] = 0;         // a0 = 0
+            ((uint64_t*) child_cs->regdata)[3]  = child_rsp; // X2/SP
+        }
+
+        // 6. Write PARENT_SETTID (child's TID) — done by clone syscall itself
+        //    when we pass CLONE_PARENT_SETTID to the host clone. We propagate
+        //    that flag through.
+
+        // 7. Allocate a host stack for the new thread and place the start args
+        //    at its top. __clone stores (fn, arg) there before the syscall and
+        //    reads them back in the child after clone returns 0.
+#define THREAD_HOST_STACK_SIZE (1u << 20) // 1 MiB host stack per thread
+        void* host_stack = mmap(NULL, THREAD_HOST_STACK_SIZE,
+                                PROT_READ|PROT_WRITE,
+                                MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0);
+        if (BAD_ADDR(host_stack))
+            return -ENOMEM;
+        void* host_stack_top = (char*) host_stack + THREAD_HOST_STACK_SIZE;
+
+        // Place ThreadStartArgs just below the stack top (16-byte aligned).
+        struct ThreadStartArgs* tsa =
+            (struct ThreadStartArgs*)
+            ((uintptr_t) host_stack_top - sizeof(*tsa));
+        tsa->cpu_state = child_cs;
+        tsa->disp_info = disp_info;
+
+        // Host clone flags: share VM + thread group + signal handlers.
+        // Forward SETTID/CLEARTID so futex-based join works correctly.
+        int host_flags = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND |
+                         CLONE_FS | CLONE_FILES | CLONE_SYSVSEM;
+        if (args.flags & CLONE_PARENT_SETTID) host_flags |= CLONE_PARENT_SETTID;
+        if (args.flags & CLONE_CHILD_CLEARTID) host_flags |= CLONE_CHILD_CLEARTID;
+        if (args.flags & CLONE_CHILD_SETTID)   host_flags |= CLONE_CHILD_SETTID;
+
+        // Use host TP to point to child CpuState (CLONE_SETTLS sets tp/tpidr).
+        host_flags |= CLONE_SETTLS;
+
+        ssize_t res = __clone(thread_entry, (void*) tsa,
+                              host_flags, tsa,
+                              (pid_t*) (uintptr_t) args.parent_tid,
+                              child_cs,                   // new TLS = CpuState*
+                              (pid_t*) (uintptr_t) args.child_tid);
+        if (res < 0) {
+            munmap(host_stack, THREAD_HOST_STACK_SIZE);
+            close(new_fd);
+        }
+        return (int) res;
     }
 
     // Flags used by fork().
@@ -236,15 +398,16 @@ handle_clone(struct State* state, struct clone_args* uargs, size_t usize) {
 
     // Ok, everything good so far, we will attempt the clone.
     int forked_translator = translator_fork_prepare(&state->translator);
-    if (forked_translator < 0)
+    if (forked_translator < 0) {
         return forked_translator;
+    }
 
     // Signature depends on architecture.
 #if defined(__x86_64__)
     // clone(flags, stack, parent_tid, child_tid, tls)
     ssize_t res = syscall(__NR_clone, flags, 0, args.parent_tid, args.child_tid,
                           args.tls, 0);
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__riscv)
     // clone(flags, stack, parent_tid, tls, child_tid)
     ssize_t res = syscall(__NR_clone, flags, 0, args.parent_tid, args.tls,
                           args.child_tid, 0);
@@ -298,7 +461,10 @@ emulate_cpuid(uint32_t rax, uint32_t rcx) {
         res.res[3] = 0x756e6547; // ebx = "Genu"
     } else if (rax == 1) { // page 1 (feature information)
         res.res[0] = 0; // eax = <not implemented>
-        res.res[1] = 0x00400000; // ecx = movbe
+        // ECX: report x86-64-v2 baseline so glibc's IFUNC selector doesn't abort.
+        // bits: SSE3(0), SSSE3(9), CX16(13), SSE4.1(19), SSE4.2(20),
+        //       MOVBE(22), POPCNT(23)
+        res.res[1] = 0x00D82201; // ecx = sse3+ssse3+cx16+sse4.1+sse4.2+movbe+popcnt
         res.res[2] = 0x07808141; // edx = pae+cmov+fxsr+sse+sse2+mmx+cx8+fpu
         res.res[3] = 0; // ebx = <not implemented>
     } else if (rax == 2) { // page 2 (TLB/cache/prefetch information)
@@ -331,18 +497,20 @@ emulate_cpuid(uint32_t rax, uint32_t rcx) {
         res.res[1] = 0x00000000; // ecx = reserved
         res.res[2] = 0x00000000; // edx = reserved
         res.res[3] = 0x00000000; // ebx = reserved
-    } else { // page 7 (structured extended feature flags)
+    } else if (rax == 7) { // page 7 (structured extended feature flags)
         if (rcx == 0) {
             res.res[0] = 0; // eax = maximum subleave supported
             res.res[1] = 0x00000000; // ecx = reserved
             res.res[2] = 0x00000000; // edx = reserved
             res.res[3] = 0x00002200; // ebx = erms+deprecate fpu-cs/ds
-        } else {
-            res.res[0] = 0x00000000; // eax = reserved
-            res.res[1] = 0x00000000; // ecx = reserved
-            res.res[2] = 0x00000000; // edx = reserved
-            res.res[3] = 0x00000000; // ebx = reserved
         }
+    } else if (rax == 0x80000000) { // extended CPUID: max extended leaf
+        res.res[0] = 0x80000001; // eax = max extended leaf supported
+    } else if (rax == 0x80000001) { // extended CPUID: extended feature flags
+        // ECX bit 0: LAHF/SAHF in 64-bit mode (required for x86-64-v2)
+        res.res[1] = 0x00000001; // ecx = lahf64
+    } else {
+        // All other leaves: return zeros
     }
     return res;
 }
@@ -648,16 +816,23 @@ emulate_syscall(uint64_t* cpu_regs) {
         break;
     }
 
+    case 60:  // exit (single thread exit — used by guest threads)
+        nr = __NR_exit;
+        goto native;
+
     case 231: {
         if (UNLIKELY(state->tc.tc_profile)) {
             dprintf(2, "Rewriting %u bytes took %u ms\n",
                     (uint32_t) state->translator.written_bytes,
                     (uint32_t) (state->rew_time / 1000000));
         }
-        // dprintf(2, "counter value: 0x%lx\n", cpu_regs[-2]);
-
         nr = __NR_exit_group;
         goto native;
+    }
+
+    case 435: { // clone3 — newer clone interface using struct clone_args
+        res = handle_clone(state, (struct clone_args*) arg0, arg1);
+        break;
     }
 
     // Some syscalls aren't implemented, but ok to ignore.

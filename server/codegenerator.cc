@@ -57,6 +57,7 @@ public:
 #endif
 
         std::string triple;
+        std::string features;
         llvm::CodeModel::Model cm;
         switch (server_config.tsc_host_arch) {
         case EM_X86_64:
@@ -67,6 +68,22 @@ public:
             triple = "aarch64-unknown-linux-gnu";
             // The AArch64 target doesn't support the medium code model.
             cm = pic ? llvm::CodeModel::Large : llvm::CodeModel::Small;
+            break;
+        case EM_RISCV:
+            triple = "riscv64-unknown-linux-gnu";
+            // Use Medium always. The Small model uses lui+addi absolute
+            // addressing, which only reaches [-2GB, +2GB]. Instrew's JIT
+            // code arena lives near MEM_BASE=0x400000000000 (2^46), well
+            // outside that range; small-model absolute addressing of
+            // constant pools (.sdata/.LCPI*) truncates and silently loads
+            // the wrong bytes at runtime. Medium uses auipc+addi which is
+            // PC-relative ±2GB — the code and its constant pool sit in
+            // the same arena, so this is comfortably in range.
+            cm = llvm::CodeModel::Medium;
+            // Enable the base extensions of RV64GC (a.k.a. rv64gcv).
+            // Without +m, LLVM emits libcalls (__muldi3, __divdi3, ...)
+            // that the minilibc client doesn't provide.
+            features = "+m,+a,+f,+d,+c,+v,+zve64d";
             break;
         default:
             std::cerr << "unknown host architecture" << std::endl;
@@ -88,7 +105,7 @@ public:
 
         target = std::unique_ptr<llvm::TargetMachine>(the_target->createTargetMachine(
             /*TT=*/triple, /*CPU=*/"",
-            /*Features=*/"", /*Options=*/target_options,
+            /*Features=*/features, /*Options=*/target_options,
             /*RelocModel=*/rm,
             /*CodeModel=*/cm,
 #if LL_LLVM_MAJOR < 18

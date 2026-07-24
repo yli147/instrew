@@ -282,6 +282,145 @@ get_thread_area(void) {
     return tp;
 }
 
+#elif defined(__riscv) && __riscv_xlen == 64
+#define R_RELATIVE R_RISCV_RELATIVE
+
+ASM_BLOCK(
+    .weak _DYNAMIC;
+    .hidden _DYNAMIC;
+    .global _start;
+_start:
+    .option push;
+    .option norelax;
+    la gp, __global_pointer$;
+    .option pop;
+    mv a0, sp;
+    .option push;
+    .option norelax;
+    la a1, _DYNAMIC;
+    .option pop;
+    andi sp, sp, -16;
+    call __start_main;
+);
+
+ASM_BLOCK(
+    .global __clone;
+    .type   __clone, @function;
+__clone:
+    andi a1, a1, -16;
+    addi a1, a1, -16;
+    sd a0, 0(a1);
+    sd a3, 8(a1);
+
+    mv a0, a2;
+    mv a2, a4;
+    mv a3, a5;
+    mv a4, a6;
+    li a7, 220;
+    ecall;
+    bnez a0, 1f;
+
+    ld a1, 0(sp);
+    ld a0, 8(sp);
+    jalr a1;
+    li a7, 93;
+    ecall;
+
+ 1: ret;
+);
+
+ASM_BLOCK(
+__restore:
+    li a7, 139;
+    ecall;
+);
+
+static
+size_t
+syscall0(int syscall_number)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0");
+    __asm__ volatile("ecall" : "=r"(a0) : "r"(a7) : "memory");
+    return a0;
+}
+
+static
+size_t
+syscall1(int syscall_number, size_t arg1)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0") = arg1;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return a0;
+}
+
+static
+size_t
+syscall2(int syscall_number, size_t arg1, size_t arg2)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0") = arg1;
+    register size_t a1 __asm__("a1") = arg2;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7), "r"(a1) : "memory");
+    return a0;
+}
+
+static
+size_t
+syscall3(int syscall_number, size_t arg1, size_t arg2, size_t arg3)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0") = arg1;
+    register size_t a1 __asm__("a1") = arg2;
+    register size_t a2 __asm__("a2") = arg3;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7), "r"(a1), "r"(a2) : "memory");
+    return a0;
+}
+
+static
+size_t
+syscall4(int syscall_number, size_t arg1, size_t arg2, size_t arg3,
+         size_t arg4)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0") = arg1;
+    register size_t a1 __asm__("a1") = arg2;
+    register size_t a2 __asm__("a2") = arg3;
+    register size_t a3 __asm__("a3") = arg4;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7), "r"(a1), "r"(a2), "r"(a3) : "memory");
+    return a0;
+}
+
+static
+size_t
+syscall6(int syscall_number, size_t arg1, size_t arg2, size_t arg3,
+         size_t arg4, size_t arg5, size_t arg6)
+{
+    register size_t a7 __asm__("a7") = syscall_number;
+    register size_t a0 __asm__("a0") = arg1;
+    register size_t a1 __asm__("a1") = arg2;
+    register size_t a2 __asm__("a2") = arg3;
+    register size_t a3 __asm__("a3") = arg4;
+    register size_t a4 __asm__("a4") = arg5;
+    register size_t a5 __asm__("a5") = arg6;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5) : "memory");
+    return a0;
+}
+
+int
+set_thread_area(void* tp) {
+    __asm__ volatile("mv tp, %0" :: "r"(tp) : "memory");
+    return 0;
+}
+
+void*
+get_thread_area(void) {
+    void* tp;
+    __asm__("mv %0, tp" : "=r"(tp));
+    return tp;
+}
+
 #else
 #error
 #endif
@@ -739,8 +878,10 @@ sigaction(int num, const struct sigaction* restrict act,
     struct sigaction kact;
     if (act) {
         kact = *act;
+#if defined(__x86_64__) || defined(__aarch64__)
         kact.sa_flags |= SA_RESTORER;
         kact.sa_restorer = __restore;
+#endif
         act = &kact;
     }
     return syscall4(__NR_rt_sigaction, num, (uintptr_t) act, (uintptr_t) oact,

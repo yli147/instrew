@@ -16,20 +16,97 @@
 // dispatcher on x86-64 below.
 uintptr_t resolve_func(struct CpuState*, uintptr_t, struct RtldPatchData*);
 
+// Loop detector: track recent PC sequence to detect infinite loops
+#define LOOP_DETECT_WINDOW 64
+static uintptr_t loop_detect_buf[LOOP_DETECT_WINDOW] = {0};
+static size_t loop_detect_len = 0;
+static uint64_t loop_detect_count = 0;
+static uint64_t loop_detect_total = 0;
+
+// Same-BB loop detector: track consecutive executions of the same translated BB
+// to catch lifters that produce infinite loops (e.g., using stale register values)
+static uintptr_t same_bb_last_addr = 0;
+static uint64_t same_bb_consecutive = 0;  // Consecutive repeats of the same BB
+static uint64_t same_bb_total_repeats = 0; // Total repeats across all BBs in the loop
+#define SAME_BB_THRESHOLD 2000  // Kill after 2k total repeats
+
+static void
+loop_detect_check(uintptr_t addr) {
+    loop_detect_total++;
+    if (loop_detect_total > 10000000) {
+        // After 10M dispatches, just sample
+        if (loop_detect_total % 1000 != 0) return;
+    }
+    if (!loop_detect_len) {
+        loop_detect_buf[loop_detect_len++] = addr;
+        return;
+    }
+    // Check if this address matches the start of the window
+    if (loop_detect_len >= 4 && addr == loop_detect_buf[0]) {
+        loop_detect_count++;
+        if (loop_detect_count == 1) {
+            dprintf(2, "\n[LOOP] Loop detected (%lx BBs, dispatch #%lx):\n", (unsigned long)loop_detect_len, loop_detect_total);
+            for (size_t i = 0; i < loop_detect_len; i++) {
+                dprintf(2, "  [%lx] 0x%lx\n", (unsigned long)i, loop_detect_buf[i]);
+            }
+        }
+        if (loop_detect_count <= 3 || (loop_detect_count % 10000 == 0)) {
+            dprintf(2, "[LOOP] iter %lx (dispatch #%lx)\n", loop_detect_count, loop_detect_total);
+        }
+        // Reset window to start fresh from this point
+        loop_detect_len = 0;
+    }
+    // Shift window
+    if (loop_detect_len >= LOOP_DETECT_WINDOW) {
+        for (size_t i = 0; i < LOOP_DETECT_WINDOW - 1; i++) {
+            loop_detect_buf[i] = loop_detect_buf[i + 1];
+        }
+        loop_detect_len = LOOP_DETECT_WINDOW - 1;
+    }
+    loop_detect_buf[loop_detect_len++] = addr;
+
+    // Same-BB loop detection - track consecutive repeats
+    // Pattern: A A A A B B B B C C C ... (loop interleaves multiple BBs)
+    // We count consecutive repeats of each BB and sum them up
+    if (addr == same_bb_last_addr) {
+        same_bb_consecutive++;
+        same_bb_total_repeats++;
+        if (same_bb_total_repeats >= SAME_BB_THRESHOLD) {
+            dprintf(2, "\n[SAME-BB-LOOP] Hot loop detected! Current BB 0x%lx has %lu consecutive repeats, %lu total repeats (dispatch #%lx)\n",
+                    (unsigned long)addr, (unsigned long)same_bb_consecutive, (unsigned long)same_bb_total_repeats, (unsigned long)loop_detect_total);
+            dprintf(2, "[SAME-BB-LOOP] This indicates a lifter bug - basic blocks loop with stale register values\n");
+            dprintf(2, "[SAME-BB-LOOP] Forcing exit to prevent hang\n");
+            _exit(1);
+        }
+    } else {
+        same_bb_last_addr = addr;
+        same_bb_consecutive = 1;
+        // Don't reset total_repeats - we want to accumulate across the loop
+    }
+}
+
 static void
 print_trace(struct CpuState* cpu_state, uintptr_t addr) {
     uint64_t* cpu_regs = (uint64_t*) cpu_state->regdata;
     dprintf(2, "Trace 0x%lx\n", addr);
+    loop_detect_check(addr);
     if (cpu_state->state->tc.tc_print_regs) {
-        dprintf(2, "RAX=%lx RBX=%lx RCX=%lx RDX=%lx\n", cpu_regs[1], cpu_regs[4], cpu_regs[2], cpu_regs[3]);
-        dprintf(2, "RSI=%lx RDI=%lx RBP=%lx RSP=%lx\n", cpu_regs[7], cpu_regs[8], cpu_regs[6], cpu_regs[5]);
-        dprintf(2, "R8 =%lx R9 =%lx R10=%lx R11=%lx\n", cpu_regs[9], cpu_regs[10], cpu_regs[11], cpu_regs[12]);
-        dprintf(2, "R12=%lx R13=%lx R14=%lx R15=%lx\n", cpu_regs[13], cpu_regs[14], cpu_regs[15], cpu_regs[16]);
-        dprintf(2, "RIP=%lx\n", addr);
-        dprintf(2, "XMM0=%lx:%lx XMM1=%lx:%lx\n", cpu_regs[18], cpu_regs[19], cpu_regs[20], cpu_regs[21]);
-        dprintf(2, "XMM2=%lx:%lx XMM3=%lx:%lx\n", cpu_regs[22], cpu_regs[23], cpu_regs[24], cpu_regs[25]);
-        dprintf(2, "XMM4=%lx:%lx XMM5=%lx:%lx\n", cpu_regs[26], cpu_regs[27], cpu_regs[28], cpu_regs[29]);
-        dprintf(2, "XMM6=%lx:%lx XMM7=%lx:%lx\n", cpu_regs[30], cpu_regs[31], cpu_regs[32], cpu_regs[33]);
+        dprintf(2, "  RAX=%lx RBX=%lx RCX=%lx RDX=%lx\n",
+                cpu_regs[1], cpu_regs[4], cpu_regs[2], cpu_regs[3]);
+        dprintf(2, "  RSI=%lx RDI=%lx RBP=%lx RSP=%lx\n",
+                cpu_regs[7], cpu_regs[8], cpu_regs[6], cpu_regs[5]);
+        dprintf(2, "  RIP=%lx\n", addr);
+        // Print XMM registers only when loop is detected (first 3 iterations)
+        if (loop_detect_count >= 1 && loop_detect_count <= 3) {
+            dprintf(2, "  XMM0=%lx:%lx XMM1=%lx:%lx\n",
+                    cpu_regs[18], cpu_regs[19], cpu_regs[20], cpu_regs[21]);
+            dprintf(2, "  XMM2=%lx:%lx XMM3=%lx:%lx\n",
+                    cpu_regs[22], cpu_regs[23], cpu_regs[24], cpu_regs[25]);
+            dprintf(2, "  XMM4=%lx:%lx XMM5=%lx:%lx\n",
+                    cpu_regs[26], cpu_regs[27], cpu_regs[28], cpu_regs[29]);
+            dprintf(2, "  XMM6=%lx:%lx XMM7=%lx:%lx\n",
+                    cpu_regs[30], cpu_regs[31], cpu_regs[32], cpu_regs[33]);
+        }
     }
 }
 
@@ -458,6 +535,181 @@ dispatch_aapcsx_fullresolve:
 
 #endif // defined(__aarch64__)
 
+#if defined(__riscv)
+
+// RISC-V LP64 dispatcher (A1' design). Physical register layout after
+// LLVM's sret lowering of the 7-element return struct:
+//   a0 = sret pointer (points to a 7-i64 slot; unused by dispatcher)
+//   a1 = sptr (regdata pointer) - persists through translated code
+//   a2 = PC (arg 1, mapped to guest PC/RIP)
+//   a3..a7 = 5 additional packed guest regs (guest-specific mapping;
+//   see SptrFields in server/callconv.cc)
+//
+// patch_data_reg = t6 (x31). No SwiftSelf: LLVM RISC-V ignores it.
+
+void dispatch_lp64();
+void dispatch_lp64_fullresolve();
+
+// Hot loop, called with a0..a7 already in position (via C ABI).
+extern void dispatch_lp64_hot(void* sret_slot, uint64_t* cpu_regs,
+                              uint64_t a2_pc, uint64_t a3, uint64_t a4,
+                              uint64_t a5, uint64_t a6, uint64_t a7);
+
+// Execution heartbeat counter - prints every N dispatches to stderr
+static volatile uint64_t exec_heartbeat_counter = 0;
+#define EXEC_HEARTBEAT_INTERVAL 1000000  // 1 million dispatches
+
+// Entry: figure out guest-specific initial values for a2..a7, then
+// call into the hot loop with sret slot pre-allocated on the stack.
+static void
+dispatch_lp64_loop(uint64_t* cpu_regs) {
+    struct CpuState* cpu_state = CPU_STATE_FROM_REGS(cpu_regs);
+    unsigned guest_arch = cpu_state->state->tsc.tsc_guest_arch;
+    // Byte offsets into regdata for the 6 in-reg guest regs (PC + 5).
+    // Field mapping mirrors server/callconv.cc CallConv::*_RV64_LP64.
+    uint64_t off[6] = {0};
+    if (guest_arch == EM_X86_64) {
+        // RIP, RAX, RCX, RDX, RBX, RSP
+        off[0] = 0;  off[1] = 8;  off[2] = 16; off[3] = 24;
+        off[4] = 32; off[5] = 40;
+    } else if (guest_arch == EM_RISCV) {
+        // RIP, X10, X11, X12, X13, X14
+        off[0] = 0;  off[1] = 88;  off[2] = 96;  off[3] = 104;
+        off[4] = 112; off[5] = 120;
+    } else if (guest_arch == EM_AARCH64) {
+        // PC, X0, X1, X2, X3, X4
+        off[0] = 0;  off[1] = 16; off[2] = 24; off[3] = 32;
+        off[4] = 40; off[5] = 48;
+    }
+    uint8_t* r = (uint8_t*) cpu_regs;
+    uint64_t sret_slot[7];  // matches LLVM 7-element ret struct
+    dispatch_lp64_hot(sret_slot, cpu_regs,
+                      *(uint64_t*)(r + off[0]),
+                      *(uint64_t*)(r + off[1]),
+                      *(uint64_t*)(r + off[2]),
+                      *(uint64_t*)(r + off[3]),
+                      *(uint64_t*)(r + off[4]),
+                      *(uint64_t*)(r + off[5]));
+}
+
+ASM_BLOCK(
+    // dispatch_lp64: quick-TLB tail dispatcher. Tail-called from
+    // translated code at BB boundaries. Physical regs on entry:
+    //   a0=sret_slot, a1=sptr, a2=PC. a3..a7 = packed guest regs.
+    // We stash a1..a7 into the sret slot first, so that any subsequent
+    // fullresolve→ret→dispatch_lp64_hot.Llp64_after_call reload path
+    // sees the current values (translated tail chains bypass the normal
+    // struct-return, so the slot could otherwise be stale).
+    .align 16;
+    .global dispatch_lp64;
+    .type dispatch_lp64, @function;
+dispatch_lp64:
+    sd a1, 0(a0);
+    sd a2, 8(a0);
+    sd a3, 16(a0);
+    sd a4, 24(a0);
+    sd a5, 32(a0);
+    sd a6, 40(a0);
+    sd a7, 48(a0);
+    li t3, ((1 << QUICK_TLB_BITS) - 1) << QUICK_TLB_BITOFF;
+    and t0, a2, t3;
+    add t0, a1, t0;
+    li t3, -CPU_STATE_REGDATA_OFFSET + CPU_STATE_QTLB_OFFSET;
+    add t0, t0, t3;
+    ld t1, 0(t0);
+    ld t2, 8(t0);
+    bne t1, a2, 1f;
+    jr t2;
+1:  mv t6, x0;
+    j dispatch_lp64_fullresolve;
+    .size dispatch_lp64, .-dispatch_lp64;
+
+    // dispatch_lp64_hot: hot loop. On entry a0..a7 already set by C.
+    // s0 keeps the sret slot pointer; a0 (sret ptr) is caller-saved by
+    // the RISC-V ABI, so we reload it after every `jalr`.
+    .align 16;
+    .global dispatch_lp64_hot;
+    .type dispatch_lp64_hot, @function;
+dispatch_lp64_hot:
+    addi sp, sp, -16;
+    sd ra, 0(sp);
+    sd s0, 8(sp);
+    mv s0, a0;
+    j .Llp64_check;
+
+.Llp64_after_call:
+    // Reload sret slot into arg regs. s0 is callee-saved so it survived.
+    mv a0, s0;
+    ld a1, 0(s0);
+    ld a2, 8(s0);
+    ld a3, 16(s0);
+    ld a4, 24(s0);
+    ld a5, 32(s0);
+    ld a6, 40(s0);
+    ld a7, 48(s0);
+.Llp64_check:
+    li t3, ((1 << QUICK_TLB_BITS) - 1) << QUICK_TLB_BITOFF;
+    and t0, a2, t3;
+    add t0, a1, t0;
+    li t3, -CPU_STATE_REGDATA_OFFSET + CPU_STATE_QTLB_OFFSET;
+    add t0, t0, t3;
+    ld t1, 0(t0);
+    ld t2, 8(t0);
+    beq t1, a2, .Llp64_hit;
+    // TLB miss: call the C resolver in-line here so ra points back to
+    // this frame's reload sequence.
+    mv t6, x0;
+    jal dispatch_lp64_fullresolve;
+    jalr t0;
+    j .Llp64_after_call;
+.Llp64_hit:
+    jalr t2;
+    j .Llp64_after_call;
+    .size dispatch_lp64_hot, .-dispatch_lp64_hot;
+
+    // dispatch_lp64_fullresolve: TLB miss → resolve_func in C. Preserves
+    // a0..a7 (sret,sptr,PC,packed) and t6; returns target address in t0.
+    // ret to caller (which will jalr t0 to enter the translated code).
+    .align 16;
+    .global dispatch_lp64_fullresolve;
+    .type dispatch_lp64_fullresolve, @function;
+dispatch_lp64_fullresolve:
+    addi sp, sp, -80;
+    sd ra, 0(sp);
+    sd a0, 8(sp);
+    sd a1, 16(sp);
+    sd a2, 24(sp);
+    sd a3, 32(sp);
+    sd a4, 40(sp);
+    sd a5, 48(sp);
+    sd a6, 56(sp);
+    sd a7, 64(sp);
+    sd t6, 72(sp);
+
+    // resolve_func(cpu_state, addr, patch_data)
+    addi a0, a1, -CPU_STATE_REGDATA_OFFSET; // arg0 = cpu_state
+    mv a1, a2;                              // arg1 = addr (PC)
+    mv a2, t6;                              // arg2 = patch_data
+    jal resolve_func;
+    mv t0, a0;                              // save target (a-reg → t-reg)
+
+    ld ra, 0(sp);
+    ld a0, 8(sp);
+    ld a1, 16(sp);
+    ld a2, 24(sp);
+    ld a3, 32(sp);
+    ld a4, 40(sp);
+    ld a5, 48(sp);
+    ld a6, 56(sp);
+    ld a7, 64(sp);
+    ld t6, 72(sp);
+    addi sp, sp, 80;
+    ret;
+    .size dispatch_lp64_fullresolve, .-dispatch_lp64_fullresolve;
+);
+
+#endif // defined(__riscv)
+
 const struct DispatcherInfo*
 dispatch_get(struct State* state) {
     static const struct DispatcherInfo infos[] = {
@@ -489,6 +741,14 @@ dispatch_get(struct State* state) {
             .patch_data_reg = 16, // x16
         },
 #endif // defined(__aarch64__)
+#if defined(__riscv)
+        [4] = {
+            .loop_func = dispatch_lp64_loop,
+            .quick_dispatch_func = (uintptr_t) dispatch_lp64,
+            .full_dispatch_func = (uintptr_t) dispatch_lp64_fullresolve,
+            .patch_data_reg = 31, // t6
+        },
+#endif // defined(__riscv)
     };
 
     unsigned callconv = state->tc.tc_callconv;
