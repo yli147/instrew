@@ -12,6 +12,9 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassTimingInfo.h>
@@ -26,9 +29,12 @@
 #include <deque>
 #include <dlfcn.h>
 #include <elf.h>
+#include <execinfo.h>
 #include <fstream>
 #include <iostream>
+#include <signal.h>
 #include <unistd.h>
+#include <iomanip>
 #include <sstream>
 #include <unordered_map>
 
@@ -41,6 +47,7 @@ enum class DumpIR {
 
 llvm::cl::opt<bool> enableProfiling("profile", llvm::cl::desc("Profile translation"), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<bool> enableTracing("trace", llvm::cl::desc("Trace execution (lots of logs)"), llvm::cl::cat(InstrewCategory));
+llvm::cl::opt<bool> enableTraceRegs("trace-regs", llvm::cl::desc("Print register state on each trace"), llvm::cl::init(false), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<unsigned char> perfSupport("perf", llvm::cl::desc("Enable perf support:"),
     llvm::cl::values(
         clEnumVal(0, "disabled"),
@@ -85,6 +92,39 @@ static llvm::GlobalVariable* CreatePcBase(llvm::LLVMContext& ctx) {
     pc_base_var->setMetadata("absolute_symbol", node);
     return pc_base_var;
 }
+
+// On RISC-V boards where SCOUNTEREN.CY=0, the `rdcycle` CSR read triggered by
+// @llvm.readcyclecounter causes SIGILL in user mode. Replace it with `rdtime`
+// (CSR 0xC01 — wall-clock timer, always user-accessible per the RISC-V spec).
+// This is RISC-V-host-only: x86/AArch64 don't have this restriction.
+static void ReplaceReadCycleCounterWithRdtime(llvm::Function* fn) {
+    llvm::Module* mod = fn->getParent();
+    llvm::LLVMContext& ctx = mod->getContext();
+    llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
+
+    llvm::Function* rcc = mod->getFunction("llvm.readcyclecounter");
+    if (!rcc)
+        return;
+
+    llvm::FunctionType* asm_ty = llvm::FunctionType::get(i64, /*vararg=*/false);
+    llvm::InlineAsm* rdtime_asm = llvm::InlineAsm::get(
+        asm_ty, "rdtime $0", "=r", /*hasSideEffects=*/false);
+
+    llvm::SmallVector<llvm::CallInst*, 8> to_replace;
+    for (auto& use : rcc->uses())
+        if (auto* ci = llvm::dyn_cast<llvm::CallInst>(use.getUser()))
+            if (ci->getParent()->getParent() == fn)
+                to_replace.push_back(ci);
+
+    for (auto* ci : to_replace) {
+        llvm::IRBuilder<> irb(ci);
+        llvm::Value* rdtime_val = irb.CreateCall(asm_ty, rdtime_asm);
+        ci->replaceAllUsesWith(rdtime_val);
+        ci->eraseFromParent();
+    }
+}
+
+static uintptr_t last_translating_addr = 0;
 
 struct IWState {
 private:
@@ -198,6 +238,7 @@ public:
         iwcc->tc_profile = enableProfiling;
         iwcc->tc_perf = perfSupport;
         iwcc->tc_print_trace = enableTracing;
+        iwcc->tc_print_regs = enableTraceRegs || enableTracing;
 
         llvm::GlobalVariable* pc_base_var = CreatePcBase(ctx);
         pc_base = llvm::ConstantExpr::getPtrToInt(pc_base_var,
@@ -265,6 +306,7 @@ public:
     }
 
     void Translate(uintptr_t addr) {
+        last_translating_addr = addr;
         auto time_predecode_start = std::chrono::steady_clock::now();
 
         // Optionally generate position-independent code, where the offset
@@ -277,7 +319,37 @@ public:
             auto iwc = reinterpret_cast<IWConnection*>(user_arg);
             return iw_readmem(iwc, addr, addr + bufsz, buf);
         };
+        // Hybrid decode strategy: try decode_cfg first (fast, translates entire CFG),
+        // then check for back-edges. If back-edges exist (loops within the lifted
+        // function), fall back to decode_block (safe but slow).
+        // Back-edges cause infinite loops because loop-carried dependencies are lost
+        // when a single lifted function contains a loop - register values become stale.
+        // With per-block lifting, loops span multiple functions and each iteration
+        // goes through the dispatch loop for proper state save/restore.
         int fail = ll_func_decode_cfg(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+        if (fail) {
+            std::cerr << "error: decode_cfg failed 0x" << std::hex << addr << std::endl;
+            ll_func_dispose(rlfn);
+            iw_sendobj(iwc, addr, nullptr, 0, nullptr);
+            return;
+        }
+        // Check for back-edges (loops) in the decoded CFG
+        if (ll_func_has_back_edges(rlfn)) {
+            // CFG has loops - dispose and retry with per-block decoding
+            if (enableProfiling) {
+                std::cerr << "hybrid: back-edges at 0x" << std::hex << addr
+                          << ", falling back to decode_block" << std::endl;
+            }
+            ll_func_dispose(rlfn);
+            rlfn = ll_func_new(llvm::wrap(mod.get()), rlcfg);
+            fail = ll_func_decode_block(rlfn, addr, accesscb, reinterpret_cast<void*>(iwc));
+            if (fail) {
+                std::cerr << "error: decode_block failed 0x" << std::hex << addr << std::endl;
+                ll_func_dispose(rlfn);
+                iw_sendobj(iwc, addr, nullptr, 0, nullptr);
+                return;
+            }
+        }
         if (fail) {
             std::cerr << "error: decode failed 0x" << std::hex << addr << std::endl;
             ll_func_dispose(rlfn);
@@ -325,7 +397,7 @@ public:
         }
 
         llvm::Function* fn = llvm::unwrap<llvm::Function>(fn_wrapped);
-        fn->setName("S0_" + llvm::Twine::utohexstr(addr));
+        fn->setName("S0");
         ll_func_dispose(rlfn);
 
         if (dumpIR.isSet(DumpIR::Lift))
@@ -335,6 +407,9 @@ public:
         fn = ChangeCallConv(fn, instrew_cc);
         if (dumpIR.isSet(DumpIR::CC))
             mod->print(llvm::errs(), nullptr);
+
+        if (iwsc->tsc_host_arch == EM_RISCV)
+            ReplaceReadCycleCounterWithRdtime(fn);
 
         auto time_llvm_opt_start = std::chrono::steady_clock::now();
         optimizer.Optimize(fn);
@@ -365,7 +440,39 @@ public:
 };
 
 
+static void CrashHandler(int sig, siginfo_t* info, void* ucp) {
+    // Force flush stderr
+    fflush(stderr);
+    fprintf(stderr, "\n*** SERVER CRASHED (signal %d) while translating 0x%012lx ***\n", sig, (unsigned long)last_translating_addr);
+    if (info) {
+        fprintf(stderr, "  Fault address: %p\n", info->si_addr);
+    }
+    void* buffer[64];
+    int nptrs = backtrace(buffer, 64);
+    char** syms = backtrace_symbols(buffer, nptrs);
+    if (syms) {
+        for (int i = 0; i < nptrs; i++)
+            fprintf(stderr, "  [%d] %s\n", i, syms[i]);
+        free(syms);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    _exit(139);
+}
+
 int main(int argc, char** argv) {
+    // Install crash handler for debugging
+    struct sigaction sa;
+    sa.sa_sigaction = CrashHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+
+    // Disable stderr buffering so crash messages appear immediately
+    setbuf(stderr, NULL);
+
     llvm::cl::HideUnrelatedOptions({&InstrewCategory, &CodeGenCategory});
     auto& optionMap = llvm::cl::getRegisteredOptions();
     optionMap["time-passes"]->setHiddenFlag(llvm::cl::Hidden);

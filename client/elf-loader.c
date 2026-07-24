@@ -192,7 +192,8 @@ load_elf_interp(const Elf_Ehdr* interp_ehdr, const Elf_Phdr interp_phdata[],
     return load_bias;
 }
 
-int load_elf_binary(const char* filename, BinaryInfo* out_info) {
+int load_elf_binary(const char* filename, const char* sysroot,
+                    BinaryInfo* out_info) {
     int retval;
     int i;
     Elf_Phdr* elf_ppnt;
@@ -242,7 +243,18 @@ int load_elf_binary(const char* filename, BinaryInfo* out_info) {
             goto out_free_ph;
         }
 
-        interp_fd = open(interp_name, O_RDONLY|O_CLOEXEC, 0);
+        // Try sysroot-prefixed path first so unpatched guest binaries work.
+        // Fall back to the raw path if sysroot is unset or the prefixed path
+        // doesn't exist (e.g. native same-arch execution).
+        if (sysroot && sysroot[0]) {
+            char sysroot_interp[PATH_MAX];
+            int n = snprintf(sysroot_interp, sizeof(sysroot_interp),
+                             "%s%s", sysroot, interp_name);
+            if (n > 0 && n < (int)sizeof(sysroot_interp))
+                interp_fd = open(sysroot_interp, O_RDONLY|O_CLOEXEC, 0);
+        }
+        if (interp_fd < 0)
+            interp_fd = open(interp_name, O_RDONLY|O_CLOEXEC, 0);
         if (interp_fd < 0) {
             retval = interp_fd;
             goto out_free_ph;

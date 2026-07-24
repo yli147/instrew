@@ -54,5 +54,8 @@ int translator_config_fetch(Translator* t, struct TranslatorConfig* cfg);
 int translator_fork_prepare(Translator* t);
 // Client fork succeeded, use forked translator from now on.
 int translator_fork_finalize(Translator* t, int fork_fd);
+// Thread init: initialize a translator on an already-forked socket fd.
+int translator_thread_init(Translator* t, int fd,
+                           const struct TranslatorServerConfig* tsc);
 
 #endif

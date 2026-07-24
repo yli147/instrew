@@ -23,6 +23,10 @@ struct BinaryInfo {
 
 typedef struct BinaryInfo BinaryInfo;
 
-int load_elf_binary(const char* filename, BinaryInfo* out_info);
+// sysroot: path prefix for guest dynamic linker lookup (NULL or "" = disabled).
+// When set, PT_INTERP is resolved as sysroot+interp_path so unpatched dynamic
+// x86 binaries run on RISC-V hosts without needing patchelf.
+int load_elf_binary(const char* filename, const char* sysroot,
+                    BinaryInfo* out_info);
 
 #endif

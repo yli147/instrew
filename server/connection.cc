@@ -7,6 +7,7 @@
 #include <llvm/Support/CommandLine.h>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -27,6 +28,8 @@ namespace {
 
 llvm::cl::opt<bool> dumpObjects("dumpobj", llvm::cl::desc("Dump compiled object files"), llvm::cl::Hidden, llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<std::string> Stub("stub", llvm::cl::desc("Path for instrew client stub (default: built-in stub). Only useful for debugging."), llvm::cl::value_desc("instrew-client"), llvm::cl::Hidden, llvm::cl::cat(InstrewCategory));
+llvm::cl::opt<std::string> GuestSysroot("sysroot", llvm::cl::desc("Sysroot for guest dynamic linker and libraries (e.g. /opt/x86-sysroot). Allows running unpatched dynamic x86 binaries without patchelf."), llvm::cl::cat(InstrewCategory));
+llvm::cl::opt<unsigned> heartbeatInterval("heartbeat", llvm::cl::desc("Print heartbeat every N translation requests (0=disabled)"), llvm::cl::init(0), llvm::cl::cat(InstrewCategory));
 llvm::cl::opt<std::string> Program(llvm::cl::Positional, llvm::cl::desc("<program>"), llvm::cl::Required);
 llvm::cl::list<std::string> ProgramArgs(llvm::cl::ConsumeAfter, llvm::cl::desc("<arguments>..."));
 
@@ -162,10 +165,13 @@ int CreateChild(char* argv0) {
 
     std::string client_config = std::to_string(fds[1]);
 
+    // Protocol: [client_binary, socket_fd, sysroot_or_empty, guest_binary, guest_args...]
+    // sysroot is "" when not specified; client skips sysroot logic in that case.
     std::vector<const char*> exec_args;
-    exec_args.reserve(ProgramArgs.size() + 4);
+    exec_args.reserve(ProgramArgs.size() + 5);
     exec_args.push_back(argv0);
     exec_args.push_back(client_config.c_str());
+    exec_args.push_back(GuestSysroot.c_str()); // "" if not set
     exec_args.push_back(Program.c_str());
     for (auto& uarg : ProgramArgs)
         exec_args.push_back(uarg.c_str());
@@ -331,6 +337,11 @@ public:
         if (need_iwcc)
             SendObject(0, "", 0, nullptr); // this will send the client config
 
+        // Heartbeat tracking
+        auto heartbeat_start = std::chrono::steady_clock::now();
+        uint64_t heartbeat_translations = 0;
+        uint64_t heartbeat_cache_hits = 0;
+
         while (true) {
             Msg::Id msgid = conn.RecvMsg();
             if (msgid == Msg::C_EXIT) {
@@ -339,7 +350,26 @@ public:
                 return 0;
             } else if (msgid == Msg::C_TRANSLATE) {
                 auto addr = conn.Read<uint64_t>();
+                auto trans_start = std::chrono::steady_clock::now();
                 fns->translate(state, addr);
+                auto trans_end = std::chrono::steady_clock::now();
+                heartbeat_translations++;
+                auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(trans_end - trans_start).count();
+
+                // Check if we should print heartbeat
+                if (heartbeatInterval && (heartbeat_translations % heartbeatInterval == 0)) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - heartbeat_start).count();
+                    auto rate = (elapsed > 0) ? heartbeat_translations / elapsed : 0;
+                    std::cerr << "[HEARTBEAT] translations=" << heartbeat_translations
+                              << ", elapsed=" << elapsed << "s"
+                              << ", rate=" << rate << "/s"
+                              << ", last_trans=" << dur_ms << "ms"
+                              << ", addr=0x" << std::hex << addr << std::dec
+                              << std::endl;
+                    heartbeat_start = now;
+                    heartbeat_translations = 0;
+                }
             } else if (msgid == Msg::C_FORK) {
                 int child_fds[2];
                 int ret = socketpair(AF_UNIX, SOCK_STREAM, 0, &child_fds[0]);
@@ -363,6 +393,14 @@ public:
                     close(child_fds[0]);
                     close(child_fds[1]);
                 }
+            } else if (msgid == Msg::C_INIT) {
+                // Thread re-init: a new client thread connected to this forked
+                // server and sent C_INIT. The server's IWState is already ready;
+                // reset need_iwcc so SendObject will re-send S_INIT followed by
+                // S_OBJECT, letting the child thread bootstrap its rtld.
+                iwsc = conn.Read<IWServerConfig>();
+                need_iwcc = (iwsc.tsc_server_mode == 0);
+                SendObject(0, "", 0, nullptr);
             } else {
                 std::cerr << "unexpected msg " << msgid << std::endl;
                 return 1;
